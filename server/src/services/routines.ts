@@ -59,7 +59,7 @@ import { parseCron, validateCron } from "./cron.js";
 import { heartbeatService } from "./heartbeat.js";
 import { queueIssueAssignmentWakeup, type IssueAssignmentWakeupDeps } from "./issue-assignment-wakeup.js";
 import { logActivity } from "./activity-log.js";
-import { instanceSettingsService } from "./instance-settings.js";
+import { applyRoutineOutcome } from "./routine-circuit-breaker.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 
 const OPEN_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked"];
@@ -1025,69 +1025,6 @@ export function routineService(
       .then((rows) => rows[0] ?? null);
   }
 
-  // Circuit breaker: track consecutive routine-run failures and auto-pause a
-  // routine once it crosses its effective threshold. A completed run resets the
-  // counter; a failed/blocked run increments it. Enforcement is free — a paused
-  // routine is dropped by tickScheduledTriggers' status="active" filter.
-  async function recordRoutineRunOutcome(
-    run: { routineId: string; companyId: string },
-    outcome: "completed" | "failed",
-    executor: Db = db,
-  ) {
-    if (outcome === "completed") {
-      await executor
-        .update(routines)
-        .set({ consecutiveFailureCount: 0, updatedAt: new Date() })
-        .where(and(eq(routines.id, run.routineId), ne(routines.consecutiveFailureCount, 0)));
-      return;
-    }
-    const [updated] = await executor
-      .update(routines)
-      .set({
-        consecutiveFailureCount: sql`${routines.consecutiveFailureCount} + 1`,
-        updatedAt: new Date(),
-      })
-      .where(eq(routines.id, run.routineId))
-      .returning({
-        status: routines.status,
-        count: routines.consecutiveFailureCount,
-        enabled: routines.autoPauseEnabled,
-        threshold: routines.autoPauseThreshold,
-      });
-    if (!updated || updated.status !== "active") return;
-
-    const general = await instanceSettingsService(db).getGeneral();
-    const effectiveEnabled = updated.enabled ?? general.autoPauseDefaultEnabled;
-    const effectiveThreshold = updated.threshold ?? general.autoPauseDefaultThreshold;
-    if (!effectiveEnabled || updated.count < effectiveThreshold) return;
-
-    const [paused] = await executor
-      .update(routines)
-      .set({
-        status: "paused",
-        autoPausedAt: new Date(),
-        autoPauseReason: "consecutive_failures",
-        updatedAt: new Date(),
-      })
-      .where(and(eq(routines.id, run.routineId), eq(routines.status, "active")))
-      .returning({ id: routines.id });
-    if (!paused) return;
-
-    await logActivity(db, {
-      companyId: run.companyId,
-      actorType: "system",
-      actorId: "routine-scheduler",
-      action: "routine.auto_paused",
-      entityType: "routine",
-      entityId: run.routineId,
-      details: {
-        reason: "consecutive_failures",
-        threshold: effectiveThreshold,
-        consecutiveFailureCount: updated.count,
-      },
-    });
-  }
-
   async function createWebhookSecret(
     companyId: string,
     routineId: string,
@@ -1470,7 +1407,9 @@ export function routineService(
           status: "failed",
           nextRunAt,
         }, txDb);
-        if (failed) await recordRoutineRunOutcome(failed, "failed", txDb);
+        // Dispatch-time failure (issue creation threw): no issue exists to
+        // transition, so count the routine failure directly here.
+        if (failed) await applyRoutineOutcome(txDb, failed.routineId, failed.companyId, "failed");
         return failed ?? createdRun;
       }
     });
@@ -2545,22 +2484,22 @@ export function routineService(
         .where(eq(issues.id, issueId))
         .then((rows) => rows[0] ?? null);
       if (!issue || issue.originKind !== "routine_execution" || !issue.originRunId) return null;
+      // NOTE: the circuit-breaker counter is NOT updated here. It fires from the
+      // issue's terminal-status transition in issuesSvc.update (the universal
+      // hook that also covers recovery-driven blocks). Counting here too would
+      // double-count the normal path. This function only finalizes the run row.
       if (issue.status === "done") {
-        const run = await finalizeRun(issue.originRunId, {
+        return finalizeRun(issue.originRunId, {
           status: "completed",
           completedAt: new Date(),
         });
-        if (run) await recordRoutineRunOutcome(run, "completed");
-        return run;
       }
       if (issue.status === "blocked" || issue.status === "cancelled") {
-        const run = await finalizeRun(issue.originRunId, {
+        return finalizeRun(issue.originRunId, {
           status: "failed",
           failureReason: `Execution issue moved to ${issue.status}`,
           completedAt: new Date(),
         });
-        if (run) await recordRoutineRunOutcome(run, "failed");
-        return run;
       }
       return null;
     },

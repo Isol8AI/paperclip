@@ -15,6 +15,8 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { applyRoutineOutcome } from "../services/routine-circuit-breaker.js";
+import { issueService } from "../services/issues.js";
 import { routineService } from "../services/routines.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -33,12 +35,14 @@ if (!embeddedPostgresSupport.supported) {
 describeEmbeddedPostgres("routine circuit breaker", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
-  let svc!: ReturnType<typeof routineService>;
+  let routinesSvc!: ReturnType<typeof routineService>;
+  let issuesSvc!: ReturnType<typeof issueService>;
 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-routine-circuit-breaker-");
     db = createDb(tempDb.connectionString);
-    svc = routineService(db, { heartbeat: { wakeup: vi.fn(async () => ({ id: randomUUID() })) } });
+    routinesSvc = routineService(db, { heartbeat: { wakeup: vi.fn(async () => ({ id: randomUUID() })) } });
+    issuesSvc = issueService(db);
   }, 20_000);
 
   afterEach(async () => {
@@ -85,12 +89,11 @@ describeEmbeddedPostgres("routine circuit breaker", () => {
       autoPausedAt: opts.autoPausedAt ?? null,
       autoPauseReason: opts.autoPausedAt ? "consecutive_failures" : null,
     }).returning();
-    return { companyId, routine };
+    return { companyId, agentId: agent.id, routine };
   }
 
-  // Seed a routine run + its execution issue, then move the issue to a terminal
-  // status so syncRunStatusForIssue produces the success/failure verdict.
-  async function resolveRunVia(companyId: string, routineId: string, issueStatus: "done" | "blocked" | "cancelled") {
+  // Seed a routine run + its execution issue (the issue an agent works on).
+  async function seedRoutineIssue(companyId: string, routineId: string, assigneeAgentId: string) {
     const runId = randomUUID();
     await db.insert(routineRuns).values({
       id: runId,
@@ -102,11 +105,12 @@ describeEmbeddedPostgres("routine circuit breaker", () => {
     const [issue] = await db.insert(issues).values({
       companyId,
       title: "sweep run",
-      status: issueStatus,
+      status: "todo",
+      assigneeAgentId,
       originKind: "routine_execution",
       originRunId: runId,
     }).returning();
-    return svc.syncRunStatusForIssue(issue.id);
+    return { runId, issueId: issue.id };
   }
 
   async function getRoutine(id: string) {
@@ -114,17 +118,19 @@ describeEmbeddedPostgres("routine circuit breaker", () => {
     return r;
   }
 
-  it("resets consecutiveFailureCount to 0 on a completed (done) run", async () => {
+  // ---- Counter logic (applyRoutineOutcome directly) ----
+
+  it("resets consecutiveFailureCount to 0 on a completed outcome", async () => {
     const { companyId, routine } = await seedRoutine({ consecutiveFailureCount: 2 });
-    await resolveRunVia(companyId, routine.id, "done");
+    await applyRoutineOutcome(db, routine.id, companyId, "completed");
     const r = await getRoutine(routine.id);
     expect(r.consecutiveFailureCount).toBe(0);
     expect(r.status).toBe("active");
   });
 
-  it("increments on a failed (blocked) run but does not pause below threshold", async () => {
+  it("increments on a failed outcome but does not pause below threshold", async () => {
     const { companyId, routine } = await seedRoutine({ consecutiveFailureCount: 1, autoPauseThreshold: 3 });
-    await resolveRunVia(companyId, routine.id, "blocked");
+    await applyRoutineOutcome(db, routine.id, companyId, "failed");
     const r = await getRoutine(routine.id);
     expect(r.consecutiveFailureCount).toBe(2);
     expect(r.status).toBe("active");
@@ -132,7 +138,7 @@ describeEmbeddedPostgres("routine circuit breaker", () => {
 
   it("pauses the routine when the failure count reaches the threshold", async () => {
     const { companyId, routine } = await seedRoutine({ consecutiveFailureCount: 2, autoPauseThreshold: 3 });
-    await resolveRunVia(companyId, routine.id, "blocked");
+    await applyRoutineOutcome(db, routine.id, companyId, "failed");
     const r = await getRoutine(routine.id);
     expect(r.consecutiveFailureCount).toBe(3);
     expect(r.status).toBe("paused");
@@ -142,16 +148,9 @@ describeEmbeddedPostgres("routine circuit breaker", () => {
     expect(events.some((e) => e.action === "routine.auto_paused")).toBe(true);
   });
 
-  it("treats a cancelled run as a failure for the breaker", async () => {
-    const { companyId, routine } = await seedRoutine({ consecutiveFailureCount: 2, autoPauseThreshold: 3 });
-    await resolveRunVia(companyId, routine.id, "cancelled");
-    const r = await getRoutine(routine.id);
-    expect(r.status).toBe("paused");
-  });
-
   it("honors a per-routine autoPauseEnabled=false override (never pauses)", async () => {
     const { companyId, routine } = await seedRoutine({ consecutiveFailureCount: 2, autoPauseThreshold: 3, autoPauseEnabled: false });
-    await resolveRunVia(companyId, routine.id, "blocked");
+    await applyRoutineOutcome(db, routine.id, companyId, "failed");
     const r = await getRoutine(routine.id);
     expect(r.consecutiveFailureCount).toBe(3);
     expect(r.status).toBe("active");
@@ -159,14 +158,61 @@ describeEmbeddedPostgres("routine circuit breaker", () => {
 
   it("uses the instance-settings default threshold (3) when the routine has no override", async () => {
     const { companyId, routine } = await seedRoutine({ consecutiveFailureCount: 2, autoPauseThreshold: null });
-    await resolveRunVia(companyId, routine.id, "blocked");
+    await applyRoutineOutcome(db, routine.id, companyId, "failed");
     const r = await getRoutine(routine.id);
     expect(r.status).toBe("paused");
   });
 
+  // ---- The real hook: issuesSvc.update terminal transitions (the recovery path that was missed) ----
+
+  it("increments the routine counter when a routine-execution issue is set to blocked via issuesSvc.update", async () => {
+    const { companyId, agentId, routine } = await seedRoutine({ consecutiveFailureCount: 0, autoPauseThreshold: 3 });
+    const { issueId } = await seedRoutineIssue(companyId, routine.id, agentId);
+    await issuesSvc.update(issueId, { status: "blocked" });
+    const r = await getRoutine(routine.id);
+    expect(r.consecutiveFailureCount).toBe(1);
+    expect(r.status).toBe("active");
+  });
+
+  it("auto-pauses when 3 routine-execution issues are blocked via issuesSvc.update (recovery-path scenario)", async () => {
+    const { companyId, agentId, routine } = await seedRoutine({ consecutiveFailureCount: 0, autoPauseThreshold: 3 });
+    for (let i = 0; i < 3; i += 1) {
+      const { issueId } = await seedRoutineIssue(companyId, routine.id, agentId);
+      await issuesSvc.update(issueId, { status: "blocked" });
+    }
+    const r = await getRoutine(routine.id);
+    expect(r.consecutiveFailureCount).toBe(3);
+    expect(r.status).toBe("paused");
+    expect(r.autoPauseReason).toBe("consecutive_failures");
+  });
+
+  it("resets the counter when a routine-execution issue is set to done via issuesSvc.update", async () => {
+    const { companyId, agentId, routine } = await seedRoutine({ consecutiveFailureCount: 2, autoPauseThreshold: 3 });
+    const { issueId } = await seedRoutineIssue(companyId, routine.id, agentId);
+    await issuesSvc.update(issueId, { status: "done" });
+    const r = await getRoutine(routine.id);
+    expect(r.consecutiveFailureCount).toBe(0);
+    expect(r.status).toBe("active");
+  });
+
+  it("does not touch the routine when a non-routine issue is updated", async () => {
+    const { companyId, agentId, routine } = await seedRoutine({ consecutiveFailureCount: 1, autoPauseThreshold: 3 });
+    const [issue] = await db.insert(issues).values({
+      companyId,
+      title: "plain issue",
+      status: "todo",
+      assigneeAgentId: agentId,
+    }).returning();
+    await issuesSvc.update(issue.id, { status: "blocked" });
+    const r = await getRoutine(routine.id);
+    expect(r.consecutiveFailureCount).toBe(1);
+  });
+
+  // ---- Resume + scheduler enforcement ----
+
   it("resets failure state when a paused routine is re-enabled", async () => {
     const { routine } = await seedRoutine({ status: "paused", consecutiveFailureCount: 3, autoPausedAt: new Date() });
-    await svc.update(routine.id, { status: "active" }, { userId: "u_test" });
+    await routinesSvc.update(routine.id, { status: "active" }, { userId: "u_test" });
     const r = await getRoutine(routine.id);
     expect(r.status).toBe("active");
     expect(r.consecutiveFailureCount).toBe(0);
@@ -184,7 +230,7 @@ describeEmbeddedPostgres("routine circuit breaker", () => {
       timezone: "UTC",
       nextRunAt: new Date(Date.now() - 60_000),
     });
-    const { triggered } = await svc.tickScheduledTriggers(new Date());
+    const { triggered } = await routinesSvc.tickScheduledTriggers(new Date());
     const runs = await db.select().from(routineRuns).where(eq(routineRuns.routineId, routine.id));
     expect(triggered).toBe(0);
     expect(runs.length).toBe(0);
