@@ -11,6 +11,7 @@ import {
   assets,
   companies,
   companyMemberships,
+  companySkillTestRuns,
   costEvents,
   documentRevisions,
   documents,
@@ -7218,6 +7219,10 @@ export function issueService(db: Db) {
         await tx.delete(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, id));
         await tx.delete(issueInboxArchives).where(eq(issueInboxArchives.issueId, id));
         await tx.delete(issueReadStates).where(eq(issueReadStates.issueId, id));
+        // company_skill_test_runs.issueId is notNull with ON DELETE restrict
+        // (new in 2026.7 Skill Studio), so the harness run rows must be deleted
+        // before the issue row — detaching is not possible on a notNull column.
+        await tx.delete(companySkillTestRuns).where(eq(companySkillTestRuns.issueId, id));
 
         // Cost/finance ledger rows also block the delete (no ON DELETE rule)
         // but are billing records that must outlive the issue — detach the
