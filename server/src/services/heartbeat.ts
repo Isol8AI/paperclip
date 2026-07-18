@@ -3800,6 +3800,80 @@ export function formatRuntimeWorkspaceWarningLog(warning: string) {
 }
 
 /**
+ * Adapters that execute on a remote runtime (the user's own OpenClaw
+ * container) rather than spawning a local process. The locally resolved cwd
+ * is bookkeeping only for these — it is never transmitted to the adapter —
+ * so local workspace-fallback warnings would mislead run-log readers.
+ */
+const REMOTE_EXECUTION_ADAPTER_TYPES = new Set(["openclaw_gateway"]);
+
+export function adapterExecutesRemotely(adapterType: string | null | undefined) {
+  return adapterType != null && REMOTE_EXECUTION_ADAPTER_TYPES.has(adapterType);
+}
+
+/**
+ * Best-effort display path for where a remote-execution adapter actually
+ * runs. OpenClaw keys each agent's workspace by its Paperclip UUID under the
+ * container user's home (the image runs as `node`). Prefer the directory
+ * implied by the adapter's claimedApiKeyPath
+ * (`~/.openclaw/workspaces/{agentId}/paperclip-claimed-api-key.json`),
+ * falling back to the same convention keyed by agent id. Display-only —
+ * never throws and never affects the run's execution cwd.
+ */
+export function deriveRemoteWorkspaceCwd(input: {
+  adapterType: string | null | undefined;
+  agentId: string;
+  adapterConfig: Record<string, unknown> | null | undefined;
+}): string | null {
+  if (!adapterExecutesRemotely(input.adapterType)) return null;
+  const fallback = `/home/node/.openclaw/workspaces/${input.agentId}`;
+  try {
+    const claimed = readNonEmptyString(input.adapterConfig?.claimedApiKeyPath);
+    if (!claimed) return fallback;
+    const slash = claimed.lastIndexOf("/");
+    if (slash <= 0) return fallback;
+    const dir = claimed.slice(0, slash);
+    return dir.startsWith("~/") ? `/home/node/${dir.slice(2)}` : dir;
+  } catch {
+    return fallback;
+  }
+}
+
+/**
+ * Run-log lines describing the workspace a run executes in. Remote-execution
+ * adapters get a single line naming the remote workspace instead of the
+ * local resolution warnings, which describe a directory those runs never use.
+ */
+export function selectRuntimeWorkspaceLogWarnings(input: {
+  remoteWorkspaceCwd: string | null;
+  localWarnings: string[];
+}): string[] {
+  return input.remoteWorkspaceCwd
+    ? [
+        `Cloud adapter run — executing in remote workspace "${input.remoteWorkspaceCwd}" on the agent's container.`,
+      ]
+    : input.localWarnings;
+}
+
+/**
+ * The session-reset log line, or null when nothing should be logged. A reset
+ * with no saved task session is a no-op — logging it would claim a session
+ * was skipped that never existed (every first run of an issue, otherwise).
+ */
+export function buildSessionResetLogLine(input: {
+  resetTaskSession: boolean;
+  sessionResetReason: string | null;
+  taskKey: string | null | undefined;
+  hadSavedTaskSession: boolean;
+}): string | null {
+  if (!input.resetTaskSession || !input.sessionResetReason) return null;
+  if (!input.hadSavedTaskSession) return null;
+  return input.taskKey
+    ? `Skipping saved session resume for task "${input.taskKey}" because ${input.sessionResetReason}.`
+    : `Skipping saved session resume because ${input.sessionResetReason}.`;
+}
+
+/**
  * A run is a "zombie" if it's marked as running in the DB but has no live
  * execution tracked in memory. This happens when the server restarts and the
  * execution is lost, or when the DB row outlives the in-memory run state.
@@ -13804,22 +13878,32 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       },
     });
     const runtimeSessionParams = runtimeSessionResolution.sessionParams;
+    const remoteWorkspaceCwd = deriveRemoteWorkspaceCwd({
+      adapterType: agent.adapterType,
+      agentId: agent.id,
+      adapterConfig: resolvedConfig,
+    });
+    const sessionResetLogLine = buildSessionResetLogLine({
+      resetTaskSession,
+      sessionResetReason,
+      taskKey,
+      hadSavedTaskSession: taskSessionDecodedParams != null,
+    });
     const runtimeWorkspaceWarnings = [
-      ...resolvedWorkspace.warnings,
-      ...executionWorkspace.warnings,
-      ...(runtimeSessionResolution.warning ? [runtimeSessionResolution.warning] : []),
-      ...(requestedShouldReuseExisting && workspaceConfigFreshness.reasons.length > 0
-        ? [
-            `Execution workspace reuse freshness action "${workspaceConfigFreshness.action}" because ${workspaceConfigFreshness.reasons.join("; ")}.`,
-          ]
-        : []),
-      ...(resetTaskSession && sessionResetReason
-        ? [
-            taskKey
-              ? `Skipping saved session resume for task "${taskKey}" because ${sessionResetReason}.`
-              : `Skipping saved session resume because ${sessionResetReason}.`,
-          ]
-        : []),
+      ...selectRuntimeWorkspaceLogWarnings({
+        remoteWorkspaceCwd,
+        localWarnings: [
+          ...resolvedWorkspace.warnings,
+          ...executionWorkspace.warnings,
+          ...(runtimeSessionResolution.warning ? [runtimeSessionResolution.warning] : []),
+          ...(requestedShouldReuseExisting && workspaceConfigFreshness.reasons.length > 0
+            ? [
+                `Execution workspace reuse freshness action "${workspaceConfigFreshness.action}" because ${workspaceConfigFreshness.reasons.join("; ")}.`,
+              ]
+            : []),
+        ],
+      }),
+      ...(sessionResetLogLine ? [sessionResetLogLine] : []),
     ];
     context.paperclipWorkspace = {
       cwd: executionWorkspace.cwd,
@@ -13833,6 +13917,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       branchName: executionWorkspace.branchName,
       worktreePath: executionWorkspace.worktreePath,
       realization: workspaceRealization,
+      ...(remoteWorkspaceCwd ? { remoteCwd: remoteWorkspaceCwd } : {}),
       agentHome: await (async () => {
         const home = resolveDefaultAgentWorkspaceDir(agent.id);
         await fs.mkdir(home, { recursive: true });
