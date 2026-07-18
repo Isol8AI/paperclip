@@ -81,6 +81,11 @@ export interface Routine {
   status: string;
   concurrencyPolicy: string;
   catchUpPolicy: string;
+  autoPauseEnabled?: boolean | null;
+  autoPauseThreshold?: number | null;
+  consecutiveFailureCount?: number;
+  autoPausedAt?: Date | null;
+  autoPauseReason?: string | null;
   originKind?: string;
   originId?: string | null;
   variables: RoutineVariable[];

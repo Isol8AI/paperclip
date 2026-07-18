@@ -89,6 +89,7 @@ import {
 import { mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
 import { buildInitialIssueMonitorFields, normalizeIssueExecutionPolicy } from "./issue-execution-policy.js";
 import { instanceSettingsService } from "./instance-settings.js";
+import { recordRoutineOutcomeForIssueRun } from "./routine-circuit-breaker.js";
 import { redactCurrentUserText } from "../log-redaction.js";
 import { redactSensitiveText } from "../redaction.js";
 import { resolveIssueGoalId, resolveNextIssueGoalId } from "./issue-goal-fallback.js";
@@ -6683,6 +6684,27 @@ export function issueService(db: Db) {
                 ),
               );
           }
+        }
+        // Routine circuit breaker: a routine-execution issue reaching a terminal
+        // status is the authoritative success/failure signal for its routine.
+        // This is the universal hook — it fires for recovery-driven blocks too
+        // (reconcile_stranded_assigned_issue), which never call
+        // syncRunStatusForIssue.
+        if (
+          existing.originKind === "routine_execution" &&
+          existing.originRunId &&
+          issueData.status &&
+          issueData.status !== existing.status &&
+          (issueData.status === "blocked" ||
+            issueData.status === "cancelled" ||
+            issueData.status === "done")
+        ) {
+          await recordRoutineOutcomeForIssueRun(
+            tx,
+            existing.originRunId,
+            existing.companyId,
+            issueData.status === "done" ? "completed" : "failed",
+          );
         }
         return enriched;
       };
