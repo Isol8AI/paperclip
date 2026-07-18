@@ -1606,9 +1606,9 @@ export function renderPaperclipWakePrompt(
     const acceptedPlanContinuation =
       !hasWakeComments &&
       normalized.interactionKind === "request_confirmation" && normalized.interactionStatus === "accepted";
-    let directive = "Make the plan only. Do not write code or perform implementation work.";
+    let directive = "Write the plan to the Paperclip plan document (PUT /api/issues/{id}/documents/plan) only — not a workspace file. Do not write code or perform implementation work.";
     if (hasWakeComments) {
-      directive = "Update the plan only. Do not write code or perform implementation work.";
+      directive = "Update the plan in the Paperclip plan document (PUT /api/issues/{id}/documents/plan) only — not a workspace file. Do not write code or perform implementation work.";
     }
     if (acceptedPlanContinuation) {
       directive = "Create child issues from the approved plan only. Do not write code or perform implementation work on the planning issue.";
