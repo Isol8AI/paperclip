@@ -11,8 +11,11 @@ import {
   assets,
   companies,
   companyMemberships,
+  costEvents,
   documentRevisions,
   documents,
+  feedbackVotes,
+  financeEvents,
   goals,
   heartbeatRuns,
   routineRuns,
@@ -7904,6 +7907,30 @@ export function issueService(db: Db) {
           .select({ documentId: issueDocuments.documentId })
           .from(issueDocuments)
           .where(eq(issueDocuments.issueId, id));
+
+        // These child tables reference issues.id with no ON DELETE rule, so
+        // their rows must be cleared before the issue row or the delete fails
+        // with a constraint violation. They are per-issue state that is
+        // meaningless without the issue.
+        await tx.delete(issueComments).where(eq(issueComments.issueId, id));
+        await tx.delete(feedbackVotes).where(eq(feedbackVotes.issueId, id));
+        await tx.delete(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, id));
+        await tx.delete(issueInboxArchives).where(eq(issueInboxArchives.issueId, id));
+        await tx.delete(issueReadStates).where(eq(issueReadStates.issueId, id));
+
+        // Cost/finance ledger rows also block the delete (no ON DELETE rule)
+        // but are billing records that must outlive the issue — detach the
+        // issue reference instead of deleting them.
+        await tx.update(costEvents).set({ issueId: null }).where(eq(costEvents.issueId, id));
+        await tx.update(financeEvents).set({ issueId: null }).where(eq(financeEvents.issueId, id));
+
+        // Sub-issues reference the parent through a self-FK with no ON DELETE
+        // rule. Promote them to top-level issues rather than deleting a whole
+        // subtree the caller never asked to remove.
+        await tx
+          .update(issues)
+          .set({ parentId: null, updatedAt: new Date() })
+          .where(eq(issues.parentId, id));
 
         const removedIssue = await tx
           .delete(issues)
