@@ -1135,7 +1135,7 @@ describe("renderPaperclipWakePrompt", () => {
     });
 
     expect(assignmentPrompt).toContain("- issue work mode: planning");
-    expect(assignmentPrompt).toContain("Make the plan only. Do not write code or perform implementation work.");
+    expect(assignmentPrompt).toContain("Write the plan to the Paperclip plan document (PUT /api/issues/{id}/documents/plan) only — not a workspace file. Do not write code or perform implementation work.");
 
     const commentPrompt = renderPaperclipWakePrompt({
       reason: "issue_commented",
@@ -1153,7 +1153,7 @@ describe("renderPaperclipWakePrompt", () => {
       fallbackFetchNeeded: false,
     });
 
-    expect(commentPrompt).toContain("Update the plan only. Do not write code or perform implementation work.");
+    expect(commentPrompt).toContain("Update the plan in the Paperclip plan document (PUT /api/issues/{id}/documents/plan) only — not a workspace file. Do not write code or perform implementation work.");
   });
 
   it("does not render stale accepted-plan continuation guidance for later planning comment wakes", () => {
@@ -1175,7 +1175,7 @@ describe("renderPaperclipWakePrompt", () => {
       fallbackFetchNeeded: false,
     });
 
-    expect(prompt).toContain("Update the plan only. Do not write code or perform implementation work.");
+    expect(prompt).toContain("Update the plan in the Paperclip plan document (PUT /api/issues/{id}/documents/plan) only — not a workspace file. Do not write code or perform implementation work.");
     expect(prompt).not.toContain("accepted-plan continuation");
     expect(prompt).not.toContain("Create child issues from the approved plan only");
   });
@@ -1224,7 +1224,7 @@ describe("renderPaperclipWakePrompt", () => {
 
     expect(prompt).toContain("accepted-plan continuation");
     expect(prompt).toContain("Create child issues from the approved plan only");
-    expect(prompt).not.toContain("Update the plan only");
+    expect(prompt).not.toContain("Update the plan in the Paperclip plan document");
   });
 
   it("renders accepted plan review context with annotation text and comments", () => {
@@ -1806,7 +1806,7 @@ describe("renderPaperclipWakePrompt - task watchdog", () => {
     });
 
     expect(prompt).toContain("## Task Watchdog Mandate");
-    expect(prompt).not.toContain("Make the plan only");
+    expect(prompt).not.toContain("Write the plan to the Paperclip plan document");
     expect(prompt).not.toContain("planning directive:");
   });
 
