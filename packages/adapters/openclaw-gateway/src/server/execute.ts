@@ -105,8 +105,10 @@ const DEFAULT_WAIT_SLICE_MS = 300_000; // 5 min/slice: each slice's response is 
 const MAX_WAIT_SLICE_MS = 540_000; // never slice above 9 min (stay under the 10-min idle cap).
 const DEFAULT_MAX_RUN_MS = 48 * 60 * 60_000; // 48h ceiling for a single detached run — a backstop; the gateway's own agent timeout normally terminates a run first.
 const RECONNECT_BEFORE_MS = 110 * 60_000; // reconnect before AWS API Gateway's hard 2-hour max WebSocket connection duration.
+const DEFAULT_STALL_TIMEOUT_MS = 15 * 60_000; // give up on a run showing no activity (no events, never started) for this long; a queued/orphaned run would otherwise hang until maxRunMs.
 const WAIT_RECONNECT_BACKOFF_MS = 2_000;
-const MAX_CONSECUTIVE_WAIT_RECONNECT_FAILURES = 5;
+const WAIT_RECONNECT_BACKOFF_MAX_MS = 30_000;
+const MAX_CONSECUTIVE_WAIT_RECONNECT_FAILURES = 8; // consecutive wait+reconnect failures (with growing backoff) before giving up — enough to ride out a gateway restart, but bounded so a dead gateway does not hang forever.
 
 const SENSITIVE_LOG_KEY_PATTERN =
   /(^|[_-])(auth|authorization|token|secret|password|api[_-]?key|private[_-]?key)([_-]|$)|^x-openclaw-(auth|token)$/i;
@@ -1100,19 +1102,26 @@ export async function awaitRunResilient(params: {
   runId: string;
   waitSliceMs: number;
   maxRunMs: number;
+  stallTimeoutMs: number;
   connectTimeoutMs: number;
   connectClient: () => Promise<ResilientWaitClient>;
   onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
+  getLastEventAt?: () => number;
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
 }): Promise<Record<string, unknown>> {
   const now = params.now ?? (() => Date.now());
   const sleep = params.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const getLastEventAt = params.getLastEventAt ?? (() => 0);
+  const backoffMs = (attempt: number) =>
+    Math.min(WAIT_RECONNECT_BACKOFF_MS * attempt, WAIT_RECONNECT_BACKOFF_MAX_MS);
   let client = params.client;
   let reconnected = false;
+  let needReconnect = false;
   let consecutiveFailures = 0;
   const startedAt = now();
   let connectionStartedAt = now();
+  let lastProgressAt = now();
 
   try {
     while (true) {
@@ -1121,16 +1130,37 @@ export async function awaitRunResilient(params: {
         return { runId: params.runId, status: "timeout", timeoutPhase: "max_run_exceeded" };
       }
 
-      // Reconnect proactively so no single connection nears the hard 2h WS cap.
-      if (now() - connectionStartedAt >= RECONNECT_BEFORE_MS) {
-        await params.onLog(
-          "stdout",
-          `[openclaw-gateway] proactively reconnecting before the 2h WS cap (runId=${params.runId})\n`,
-        );
-        client.close();
-        client = await params.connectClient();
-        reconnected = true;
-        connectionStartedAt = now();
+      // Give up on a run showing no progress (no events, and no started/active
+      // signal) for stallTimeoutMs: a run queued behind a provider that never
+      // starts, or one orphaned by a gateway restart, would otherwise hang until
+      // maxRunMs. Streamed events keep this fresh across reconnects.
+      if (now() - Math.max(lastProgressAt, getLastEventAt()) >= params.stallTimeoutMs) {
+        return { runId: params.runId, status: "timeout", timeoutPhase: "stalled" };
+      }
+
+      // (Re)connect — proactively before the hard 2h WS cap, or to recover from a
+      // dropped wait. A reconnect that throws counts against the same failure
+      // budget and is retried, rather than escaping and abandoning a live run.
+      if (needReconnect || now() - connectionStartedAt >= RECONNECT_BEFORE_MS) {
+        try {
+          client.close();
+          client = await params.connectClient();
+          reconnected = true;
+          needReconnect = false;
+          connectionStartedAt = now();
+        } catch (err) {
+          consecutiveFailures += 1;
+          const message = err instanceof Error ? err.message : String(err);
+          if (consecutiveFailures > MAX_CONSECUTIVE_WAIT_RECONNECT_FAILURES) {
+            throw err instanceof Error ? err : new Error(message);
+          }
+          await params.onLog(
+            "stdout",
+            `[openclaw-gateway] reconnect failed: ${message}; retry ${consecutiveFailures}/${MAX_CONSECUTIVE_WAIT_RECONNECT_FAILURES} (runId=${params.runId})\n`,
+          );
+          await sleep(backoffMs(consecutiveFailures));
+          continue;
+        }
       }
 
       const sliceMs = Math.max(1, Math.min(params.waitSliceMs, params.maxRunMs - elapsed));
@@ -1141,7 +1171,6 @@ export async function awaitRunResilient(params: {
           { runId: params.runId, timeoutMs: sliceMs },
           { timeoutMs: sliceMs + params.connectTimeoutMs },
         );
-        consecutiveFailures = 0;
       } catch (err) {
         consecutiveFailures += 1;
         const message = err instanceof Error ? err.message : String(err);
@@ -1152,18 +1181,25 @@ export async function awaitRunResilient(params: {
           "stdout",
           `[openclaw-gateway] wait interrupted (${message}); reconnecting ${consecutiveFailures}/${MAX_CONSECUTIVE_WAIT_RECONNECT_FAILURES} (runId=${params.runId})\n`,
         );
-        client.close();
-        await sleep(WAIT_RECONNECT_BACKOFF_MS);
-        client = await params.connectClient();
-        reconnected = true;
-        connectionStartedAt = now();
+        needReconnect = true;
+        await sleep(backoffMs(consecutiveFailures));
         continue;
       }
 
+      consecutiveFailures = 0;
       if (!isWaitPending(waitPayload)) {
         return waitPayload;
       }
-      // Slice expired while the run is still active — keep waiting.
+
+      // Slice expired while the run is still active. A started/active run (per the
+      // wait response — reliable on the submitting connection) counts as progress,
+      // so the stall bound only trips on genuinely stuck runs.
+      if (
+        waitPayload?.providerStarted === true ||
+        nonEmpty(waitPayload?.timeoutPhase) === "gateway_draining"
+      ) {
+        lastProgressAt = now();
+      }
     }
   } finally {
     if (reconnected) client.close();
@@ -1215,6 +1251,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     MAX_WAIT_SLICE_MS,
   );
   const maxRunMs = parseOptionalPositiveInteger(ctx.config.maxRunMs) ?? DEFAULT_MAX_RUN_MS;
+  const stallTimeoutMs = parseOptionalPositiveInteger(ctx.config.stallTimeoutMs) ?? DEFAULT_STALL_TIMEOUT_MS;
 
   const payloadTemplate = parseObject(ctx.config.payloadTemplate);
   const transportHint = nonEmpty(ctx.config.streamTransport) ?? nonEmpty(ctx.config.transport);
@@ -1316,6 +1353,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   while (true) {
     const trackedRunIds = new Set<string>([ctx.runId]);
     const assistantChunks: string[] = [];
+    let lastEventAt = Date.now();
     let lifecycleError: string | null = null;
     let deviceIdentity: GatewayDeviceIdentity | null = null;
 
@@ -1335,6 +1373,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
       const runId = nonEmpty(payload.runId);
       if (!runId || !trackedRunIds.has(runId)) return;
+
+      // Any event for the tracked run is liveness evidence for awaitRunResilient's
+      // stall bound (reliable across reconnects — an active run keeps emitting).
+      lastEventAt = Date.now();
 
       const stream = nonEmpty(payload.stream) ?? "unknown";
       const data = asRecord(payload.data) ?? {};
@@ -1442,7 +1484,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           onEvent,
           onLog: ctx.onLog,
         });
-        await reconnectedClient.connect(buildConnectParams, connectTimeoutMs);
+        try {
+          await reconnectedClient.connect(buildConnectParams, connectTimeoutMs);
+        } catch (err) {
+          // Don't leak the socket/FD if connect() rejects (e.g. open timeout).
+          reconnectedClient.close();
+          throw err;
+        }
         await ctx.onLog("stdout", "[openclaw-gateway] reconnected to resume agent.wait\n");
         return reconnectedClient;
       };
@@ -1490,23 +1538,29 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           runId: acceptedRunId,
           waitSliceMs,
           maxRunMs,
+          stallTimeoutMs,
           connectTimeoutMs,
           connectClient,
           onLog: ctx.onLog,
+          getLastEventAt: () => lastEventAt,
         });
 
         latestResultPayload = waitPayload;
 
         const waitStatus = nonEmpty(waitPayload?.status)?.toLowerCase() ?? "";
         if (waitStatus === "timeout") {
-          const maxRunExceeded = nonEmpty(waitPayload?.timeoutPhase) === "max_run_exceeded";
+          const timeoutPhase = nonEmpty(waitPayload?.timeoutPhase);
+          const errorMessage =
+            timeoutPhase === "max_run_exceeded"
+              ? `OpenClaw gateway run exceeded max duration ${maxRunMs}ms`
+              : timeoutPhase === "stalled"
+                ? `OpenClaw gateway run showed no activity for ${stallTimeoutMs}ms (stalled)`
+                : `OpenClaw gateway run timed out (${timeoutPhase ?? "unknown"})`;
           return {
             exitCode: 1,
             signal: null,
             timedOut: true,
-            errorMessage: maxRunExceeded
-              ? `OpenClaw gateway run exceeded max duration ${maxRunMs}ms`
-              : `OpenClaw gateway run timed out (${nonEmpty(waitPayload?.timeoutPhase) ?? "unknown"})`,
+            errorMessage,
             errorCode: "openclaw_gateway_wait_timeout",
             resultJson: waitPayload,
           };
@@ -1538,6 +1592,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         }
       }
 
+      // Best-effort run summary from the streamed assistant text. NOTE: across a
+      // reconnect the fresh connection only sees events emitted after it
+      // subscribed, so for a run that reconnected this can be a partial fragment,
+      // and agent.wait carries no result text to fall back to. This affects only
+      // the summary text — the agent commits its actual work directly to the
+      // Paperclip API during the run. A complete post-reconnect summary fetch is
+      // a tracked follow-up.
       const summaryFromEvents = assistantChunks.join("").trim();
       const summaryFromPayload =
         extractResultText(asRecord(acceptedPayload?.result)) ??
