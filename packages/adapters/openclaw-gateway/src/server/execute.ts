@@ -1115,8 +1115,21 @@ export async function awaitRunResilient(params: {
   const getLastEventAt = params.getLastEventAt ?? (() => 0);
   const backoffMs = (attempt: number) =>
     Math.min(WAIT_RECONNECT_BACKOFF_MS * attempt, WAIT_RECONNECT_BACKOFF_MAX_MS);
+  // Shared failure handling for both the reconnect and wait paths: count the
+  // failure against the budget (throwing once exhausted), log, and back off.
+  const registerFailure = async (err: unknown, label: string): Promise<void> => {
+    consecutiveFailures += 1;
+    const message = err instanceof Error ? err.message : String(err);
+    if (consecutiveFailures > MAX_CONSECUTIVE_WAIT_RECONNECT_FAILURES) {
+      throw err instanceof Error ? err : new Error(message);
+    }
+    await params.onLog(
+      "stdout",
+      `[openclaw-gateway] ${label} (${message}); retry ${consecutiveFailures}/${MAX_CONSECUTIVE_WAIT_RECONNECT_FAILURES} (runId=${params.runId})\n`,
+    );
+    await sleep(backoffMs(consecutiveFailures));
+  };
   let client = params.client;
-  let reconnected = false;
   let needReconnect = false;
   let consecutiveFailures = 0;
   const startedAt = now();
@@ -1145,20 +1158,10 @@ export async function awaitRunResilient(params: {
         try {
           client.close();
           client = await params.connectClient();
-          reconnected = true;
           needReconnect = false;
           connectionStartedAt = now();
         } catch (err) {
-          consecutiveFailures += 1;
-          const message = err instanceof Error ? err.message : String(err);
-          if (consecutiveFailures > MAX_CONSECUTIVE_WAIT_RECONNECT_FAILURES) {
-            throw err instanceof Error ? err : new Error(message);
-          }
-          await params.onLog(
-            "stdout",
-            `[openclaw-gateway] reconnect failed: ${message}; retry ${consecutiveFailures}/${MAX_CONSECUTIVE_WAIT_RECONNECT_FAILURES} (runId=${params.runId})\n`,
-          );
-          await sleep(backoffMs(consecutiveFailures));
+          await registerFailure(err, "reconnect failed");
           continue;
         }
       }
@@ -1172,17 +1175,8 @@ export async function awaitRunResilient(params: {
           { timeoutMs: sliceMs + params.connectTimeoutMs },
         );
       } catch (err) {
-        consecutiveFailures += 1;
-        const message = err instanceof Error ? err.message : String(err);
-        if (consecutiveFailures > MAX_CONSECUTIVE_WAIT_RECONNECT_FAILURES) {
-          throw err instanceof Error ? err : new Error(message);
-        }
-        await params.onLog(
-          "stdout",
-          `[openclaw-gateway] wait interrupted (${message}); reconnecting ${consecutiveFailures}/${MAX_CONSECUTIVE_WAIT_RECONNECT_FAILURES} (runId=${params.runId})\n`,
-        );
+        await registerFailure(err, "wait interrupted");
         needReconnect = true;
-        await sleep(backoffMs(consecutiveFailures));
         continue;
       }
 
@@ -1202,7 +1196,8 @@ export async function awaitRunResilient(params: {
       }
     }
   } finally {
-    if (reconnected) client.close();
+    // The caller owns params.client; only close a socket we opened ourselves.
+    if (client !== params.client) client.close();
   }
 }
 
@@ -1406,12 +1401,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       }
     };
 
-    const client = new GatewayWsClient({
-      url: parsedUrl.toString(),
-      headers,
-      onEvent,
-      onLog: ctx.onLog,
-    });
+    const makeClient = () =>
+      new GatewayWsClient({
+        url: parsedUrl.toString(),
+        headers,
+        onEvent,
+        onLog: ctx.onLog,
+      });
+    const client = makeClient();
 
     try {
       deviceIdentity = disableDeviceAuth ? null : resolveDeviceIdentity(parseObject(ctx.config));
@@ -1478,12 +1475,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       // drop or the 2h WS cap. The device is already paired from the initial
       // connect, so no pairing handshake is needed here.
       const connectClient = async (): Promise<GatewayWsClient> => {
-        const reconnectedClient = new GatewayWsClient({
-          url: parsedUrl.toString(),
-          headers,
-          onEvent,
-          onLog: ctx.onLog,
-        });
+        const reconnectedClient = makeClient();
         try {
           await reconnectedClient.connect(buildConnectParams, connectTimeoutMs);
         } catch (err) {
