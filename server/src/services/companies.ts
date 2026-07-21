@@ -65,11 +65,96 @@ import {
   toolMcpGateways,
   workspaceRuntimeServices,
 } from "@paperclipai/db";
+import type { PgColumn, PgTable } from "drizzle-orm/pg-core";
 import { notFound, unprocessable } from "../errors.js";
 import { environmentService } from "./environments.js";
 import { heartbeatService } from "./heartbeat.js";
 import { logActivity } from "./activity-log.js";
 import { builtInAgentService } from "./built-in-agents.js";
+
+type CompanyScopedTable = PgTable & { companyId: PgColumn };
+
+// The ordered delete sequence remove() executes, children-before-parents so no
+// NO ACTION / RESTRICT foreign key is violated mid-way: every table listed
+// either references companies without ON DELETE CASCADE or references (also
+// non-cascading) a table deleted later in the sequence. Company-scoped tables
+// absent here are emptied by ON DELETE CASCADE from one of the explicit
+// deletes (or the final companies delete). The company-delete-cascade test
+// replays this sequence against the live FK graph, so a new table that breaks
+// coverage or ordering fails CI instead of 500ing DELETE /api/companies/:id.
+export const COMPANY_DELETE_SEQUENCE: readonly CompanyScopedTable[] = [
+  // Run + ledger rows (before heartbeat_runs / goals / projects / agents).
+  heartbeatRunEvents,
+  heartbeatRunWatchdogDecisions,
+  agentTaskSessions,
+  activityLog,
+  financeEvents,
+  costEvents,
+  heartbeatRuns,
+  agentWakeupRequests,
+  agentApiKeys,
+  agentRuntimeState,
+  agentConfigRevisions,
+  // Approvals + budget enforcement (incidents reference approvals and policies).
+  approvalComments,
+  issueApprovals,
+  budgetIncidents,
+  approvals,
+  budgetPolicies,
+  // Skill studio (test runs RESTRICT skill versions, agents, and issues).
+  companySkillTestRuns,
+  companySkills,
+  // Secrets.
+  companySecretBindings,
+  secretAccessEvents,
+  companySecrets,
+  // Membership + access.
+  joinRequests,
+  invites,
+  principalPermissionGrants,
+  companyMemberships,
+  inboxDismissals,
+  toolMcpGateways,
+  // Routines (before agents via assignee_agent_id).
+  routineRuns,
+  routineTriggers,
+  routineRevisions,
+  routineDocuments,
+  routines,
+  // Documents + annotations.
+  documentAnnotationAnchorSnapshots,
+  documentAnnotationComments,
+  documentAnnotationThreads,
+  documents,
+  // Issue graph (everything referencing issues, then issues themselves).
+  issueComments,
+  issueReadStates,
+  issueAttachments,
+  issueDocuments,
+  issueExecutionDecisions,
+  issueInboxArchives,
+  issuePlanDecompositions,
+  issueRecoveryActions,
+  issueReferenceMentions,
+  issueRelations,
+  issueThreadInteractions,
+  issueTreeHoldMembers,
+  issueTreeHolds,
+  issueWatchdogs,
+  issueWorkProducts,
+  feedbackExports,
+  feedbackVotes,
+  issues,
+  // Workspaces + structure (projects before goals: projects.goal_id).
+  workspaceRuntimeServices,
+  projectWorkspaces,
+  projectGoals,
+  projects,
+  goals,
+  companyLogos,
+  assets,
+  agents,
+];
 
 export interface CompanyActivityActor {
   actorType: "user" | "agent" | "system" | "plugin";
@@ -463,99 +548,23 @@ export function companyService(db: Db) {
 
     remove: (id: string) =>
       db.transaction(async (tx) => {
-        // Delete company-scoped rows children-before-parents; the order is
-        // derived from the FK graph (tables whose FKs lack ON DELETE CASCADE /
-        // SET NULL must be emptied before the row they reference is deleted).
-        // Tables absent here cascade from one of the deletes below.
+        // heartbeat_run_events rows can reference this company's runs while
+        // carrying a different company_id, so clear them by run id before the
+        // sequence below deletes heartbeat_runs.
         const companyRunIds = await tx
           .select({ id: heartbeatRuns.id })
           .from(heartbeatRuns)
           .where(eq(heartbeatRuns.companyId, id));
-
-        // Run + ledger rows (before heartbeat_runs / goals / projects / agents).
-        await tx.delete(heartbeatRunEvents).where(eq(heartbeatRunEvents.companyId, id));
         if (companyRunIds.length > 0) {
           await tx
             .delete(heartbeatRunEvents)
             .where(inArray(heartbeatRunEvents.runId, companyRunIds.map((run) => run.id)));
         }
-        await tx.delete(heartbeatRunWatchdogDecisions).where(eq(heartbeatRunWatchdogDecisions.companyId, id));
-        await tx.delete(agentTaskSessions).where(eq(agentTaskSessions.companyId, id));
-        await tx.delete(activityLog).where(eq(activityLog.companyId, id));
-        await tx.delete(financeEvents).where(eq(financeEvents.companyId, id));
-        await tx.delete(costEvents).where(eq(costEvents.companyId, id));
-        await tx.delete(heartbeatRuns).where(eq(heartbeatRuns.companyId, id));
-        await tx.delete(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, id));
-        await tx.delete(agentApiKeys).where(eq(agentApiKeys.companyId, id));
-        await tx.delete(agentRuntimeState).where(eq(agentRuntimeState.companyId, id));
-        await tx.delete(agentConfigRevisions).where(eq(agentConfigRevisions.companyId, id));
 
-        // Approvals + budget enforcement (incidents reference approvals and policies).
-        await tx.delete(approvalComments).where(eq(approvalComments.companyId, id));
-        await tx.delete(issueApprovals).where(eq(issueApprovals.companyId, id));
-        await tx.delete(budgetIncidents).where(eq(budgetIncidents.companyId, id));
-        await tx.delete(approvals).where(eq(approvals.companyId, id));
-        await tx.delete(budgetPolicies).where(eq(budgetPolicies.companyId, id));
+        for (const table of COMPANY_DELETE_SEQUENCE) {
+          await tx.delete(table).where(eq(table.companyId, id));
+        }
 
-        // Skill studio (test runs RESTRICT skill versions, agents, and issues).
-        await tx.delete(companySkillTestRuns).where(eq(companySkillTestRuns.companyId, id));
-        await tx.delete(companySkills).where(eq(companySkills.companyId, id));
-
-        // Secrets.
-        await tx.delete(companySecretBindings).where(eq(companySecretBindings.companyId, id));
-        await tx.delete(secretAccessEvents).where(eq(secretAccessEvents.companyId, id));
-        await tx.delete(companySecrets).where(eq(companySecrets.companyId, id));
-
-        // Membership + access.
-        await tx.delete(joinRequests).where(eq(joinRequests.companyId, id));
-        await tx.delete(invites).where(eq(invites.companyId, id));
-        await tx.delete(principalPermissionGrants).where(eq(principalPermissionGrants.companyId, id));
-        await tx.delete(companyMemberships).where(eq(companyMemberships.companyId, id));
-        await tx.delete(inboxDismissals).where(eq(inboxDismissals.companyId, id));
-        await tx.delete(toolMcpGateways).where(eq(toolMcpGateways.companyId, id));
-
-        // Routines (before agents via assignee_agent_id).
-        await tx.delete(routineRuns).where(eq(routineRuns.companyId, id));
-        await tx.delete(routineTriggers).where(eq(routineTriggers.companyId, id));
-        await tx.delete(routineRevisions).where(eq(routineRevisions.companyId, id));
-        await tx.delete(routineDocuments).where(eq(routineDocuments.companyId, id));
-        await tx.delete(routines).where(eq(routines.companyId, id));
-
-        // Documents + annotations.
-        await tx.delete(documentAnnotationAnchorSnapshots).where(eq(documentAnnotationAnchorSnapshots.companyId, id));
-        await tx.delete(documentAnnotationComments).where(eq(documentAnnotationComments.companyId, id));
-        await tx.delete(documentAnnotationThreads).where(eq(documentAnnotationThreads.companyId, id));
-        await tx.delete(documents).where(eq(documents.companyId, id));
-
-        // Issue graph (everything referencing issues, then issues themselves).
-        await tx.delete(issueComments).where(eq(issueComments.companyId, id));
-        await tx.delete(issueReadStates).where(eq(issueReadStates.companyId, id));
-        await tx.delete(issueAttachments).where(eq(issueAttachments.companyId, id));
-        await tx.delete(issueDocuments).where(eq(issueDocuments.companyId, id));
-        await tx.delete(issueExecutionDecisions).where(eq(issueExecutionDecisions.companyId, id));
-        await tx.delete(issueInboxArchives).where(eq(issueInboxArchives.companyId, id));
-        await tx.delete(issuePlanDecompositions).where(eq(issuePlanDecompositions.companyId, id));
-        await tx.delete(issueRecoveryActions).where(eq(issueRecoveryActions.companyId, id));
-        await tx.delete(issueReferenceMentions).where(eq(issueReferenceMentions.companyId, id));
-        await tx.delete(issueRelations).where(eq(issueRelations.companyId, id));
-        await tx.delete(issueThreadInteractions).where(eq(issueThreadInteractions.companyId, id));
-        await tx.delete(issueTreeHoldMembers).where(eq(issueTreeHoldMembers.companyId, id));
-        await tx.delete(issueTreeHolds).where(eq(issueTreeHolds.companyId, id));
-        await tx.delete(issueWatchdogs).where(eq(issueWatchdogs.companyId, id));
-        await tx.delete(issueWorkProducts).where(eq(issueWorkProducts.companyId, id));
-        await tx.delete(feedbackExports).where(eq(feedbackExports.companyId, id));
-        await tx.delete(feedbackVotes).where(eq(feedbackVotes.companyId, id));
-        await tx.delete(issues).where(eq(issues.companyId, id));
-
-        // Workspaces + structure (projects before goals: projects.goal_id).
-        await tx.delete(workspaceRuntimeServices).where(eq(workspaceRuntimeServices.companyId, id));
-        await tx.delete(projectWorkspaces).where(eq(projectWorkspaces.companyId, id));
-        await tx.delete(projectGoals).where(eq(projectGoals.companyId, id));
-        await tx.delete(projects).where(eq(projects.companyId, id));
-        await tx.delete(goals).where(eq(goals.companyId, id));
-        await tx.delete(companyLogos).where(eq(companyLogos.companyId, id));
-        await tx.delete(assets).where(eq(assets.companyId, id));
-        await tx.delete(agents).where(eq(agents.companyId, id));
         const rows = await tx
           .delete(companies)
           .where(eq(companies.id, id))

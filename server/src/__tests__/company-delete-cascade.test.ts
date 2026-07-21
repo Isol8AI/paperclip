@@ -1,14 +1,21 @@
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { eq, getTableName, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
+  agentApiKeys,
   agentConfigRevisions,
+  agentRuntimeState,
+  agentTaskSessions,
+  agentWakeupRequests,
   agents,
+  approvalComments,
   approvals,
+  assets,
   budgetIncidents,
   budgetPolicies,
   companies,
+  companyLogos,
   companySkills,
   companySkillTestRuns,
   companySkillVersions,
@@ -18,15 +25,19 @@ import {
   feedbackVotes,
   financeEvents,
   goals,
+  heartbeatRunEvents,
   heartbeatRuns,
   heartbeatRunWatchdogDecisions,
   inboxDismissals,
+  invites,
   issueComments,
+  issueExecutionDecisions,
   issueInboxArchives,
   issueReadStates,
   issueThreadInteractions,
   issueWatchdogs,
   issues,
+  joinRequests,
   projects,
   routines,
   secretAccessEvents,
@@ -38,7 +49,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { companyService } from "../services/companies.ts";
+import { COMPANY_DELETE_SEQUENCE, companyService } from "../services/companies.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -47,6 +58,67 @@ if (!embeddedPostgresSupport.supported) {
   console.warn(
     `Skipping company delete cascade tests on this host: ${embeddedPostgresSupport.reason ?? "unsupported environment"}`,
   );
+}
+
+/** One foreign-key edge of the live database: childTable.childColumns -> parentTable. */
+type FkEdge = {
+  constraintName: string;
+  childTable: string;
+  parentTable: string;
+  onDelete: string;
+  childColumns: string;
+  anyChildColumnNotNull: boolean;
+};
+
+async function loadPublicFkGraph(db: ReturnType<typeof createDb>): Promise<FkEdge[]> {
+  const rows = await db.execute(sql`
+    select
+      con.conname as constraint_name,
+      child.relname as child_table,
+      parent.relname as parent_table,
+      case con.confdeltype
+        when 'a' then 'no action'
+        when 'r' then 'restrict'
+        when 'c' then 'cascade'
+        when 'n' then 'set null'
+        when 'd' then 'set default'
+        else con.confdeltype::text
+      end as on_delete,
+      (
+        select string_agg(att.attname, ', ' order by cols.ord)
+        from unnest(con.conkey) with ordinality as cols(attnum, ord)
+        join pg_attribute att on att.attrelid = con.conrelid and att.attnum = cols.attnum
+      ) as child_columns,
+      (
+        select bool_or(att.attnotnull)
+        from unnest(con.conkey) as cols(attnum)
+        join pg_attribute att on att.attrelid = con.conrelid and att.attnum = cols.attnum
+      ) as any_child_column_not_null
+    from pg_constraint con
+    join pg_class child on child.oid = con.conrelid
+    join pg_class parent on parent.oid = con.confrelid
+    join pg_namespace ns on ns.oid = child.relnamespace
+    where con.contype = 'f' and ns.nspname = 'public'
+    order by child.relname, con.conname
+  `);
+  return [...rows].map((row) => ({
+    constraintName: String(row.constraint_name),
+    childTable: String(row.child_table),
+    parentTable: String(row.parent_table),
+    onDelete: String(row.on_delete),
+    childColumns: String(row.child_columns),
+    anyChildColumnNotNull: row.any_child_column_not_null === true,
+  }));
+}
+
+async function loadPublicTableNames(db: ReturnType<typeof createDb>): Promise<Set<string>> {
+  const rows = await db.execute(sql`
+    select cls.relname as table_name
+    from pg_class cls
+    join pg_namespace ns on ns.oid = cls.relnamespace
+    where ns.nspname = 'public' and cls.relkind = 'r'
+  `);
+  return new Set([...rows].map((row) => String(row.table_name)));
 }
 
 describeEmbeddedPostgres("company delete cascade", () => {
@@ -69,6 +141,7 @@ describeEmbeddedPostgres("company delete cascade", () => {
     const projectId = randomUUID();
     const issueId = randomUUID();
     const runId = randomUUID();
+    const wakeupRequestId = randomUUID();
     const approvalId = randomUUID();
     const budgetPolicyId = randomUUID();
     const costEventId = randomUUID();
@@ -76,6 +149,8 @@ describeEmbeddedPostgres("company delete cascade", () => {
     const skillVersionId = randomUUID();
     const toolProfileId = randomUUID();
     const feedbackVoteId = randomUUID();
+    const assetId = randomUUID();
+    const inviteId = randomUUID();
 
     await db.insert(companies).values({
       id: companyId,
@@ -94,6 +169,14 @@ describeEmbeddedPostgres("company delete cascade", () => {
       adapterConfig: {},
       runtimeConfig: {},
       permissions: {},
+    });
+
+    await db.insert(agentWakeupRequests).values({
+      id: wakeupRequestId,
+      companyId,
+      agentId,
+      source: "timer",
+      status: "completed",
     });
 
     // goals <- projects.goal_id (no ON DELETE): deleting goals before projects
@@ -132,6 +215,39 @@ describeEmbeddedPostgres("company delete cascade", () => {
       invocationSource: "assignment",
       status: "completed",
       contextSnapshot: { issueId },
+      wakeupRequestId,
+    });
+
+    await db.insert(heartbeatRunEvents).values({
+      companyId,
+      runId,
+      agentId,
+      seq: 1,
+      eventType: "log",
+      message: "run started",
+    });
+
+    await db.insert(agentTaskSessions).values({
+      id: randomUUID(),
+      companyId,
+      agentId,
+      adapterType: "codex_local",
+      taskKey: `issue:${issueId}`,
+      lastRunId: runId,
+    });
+
+    await db.insert(agentApiKeys).values({
+      id: randomUUID(),
+      agentId,
+      companyId,
+      name: "ci key",
+      keyHash: randomUUID(),
+    });
+
+    await db.insert(agentRuntimeState).values({
+      agentId,
+      companyId,
+      adapterType: "codex_local",
     });
 
     // cost/finance events pinned to the run: the old order deleted
@@ -160,6 +276,7 @@ describeEmbeddedPostgres("company delete cascade", () => {
       occurredAt: new Date(),
       costEventId,
       heartbeatRunId: runId,
+      agentId,
       goalId,
       projectId,
     });
@@ -169,6 +286,7 @@ describeEmbeddedPostgres("company delete cascade", () => {
       companyId,
       actorType: "agent",
       actorId: agentId,
+      agentId,
       action: "heartbeat.completed",
       entityType: "issue",
       entityId: issueId,
@@ -246,12 +364,32 @@ describeEmbeddedPostgres("company delete cascade", () => {
       watchdogAgentId: agentId,
     });
 
+    await db.insert(issueExecutionDecisions).values({
+      id: randomUUID(),
+      companyId,
+      issueId,
+      stageId: randomUUID(),
+      stageType: "kickoff",
+      actorAgentId: agentId,
+      outcome: "proceed",
+      body: "go ahead",
+      createdByRunId: runId,
+    });
+
     await db.insert(approvals).values({
       id: approvalId,
       companyId,
       type: "budget_exception",
       payload: {},
       requestedByAgentId: agentId,
+    });
+
+    await db.insert(approvalComments).values({
+      id: randomUUID(),
+      companyId,
+      approvalId,
+      authorAgentId: agentId,
+      body: "looks fine",
     });
 
     await db.insert(budgetPolicies).values({
@@ -371,6 +509,40 @@ describeEmbeddedPostgres("company delete cascade", () => {
       goalId,
     });
 
+    await db.insert(assets).values({
+      id: assetId,
+      companyId,
+      provider: "local",
+      objectKey: `logos/${assetId}.png`,
+      contentType: "image/png",
+      byteSize: 12,
+      sha256: "0".repeat(64),
+      createdByAgentId: agentId,
+    });
+
+    await db.insert(companyLogos).values({
+      id: randomUUID(),
+      companyId,
+      assetId,
+    });
+
+    await db.insert(invites).values({
+      id: inviteId,
+      companyId,
+      tokenHash: randomUUID(),
+      expiresAt: new Date(Date.now() + 86_400_000),
+    });
+
+    await db.insert(joinRequests).values({
+      id: randomUUID(),
+      inviteId,
+      companyId,
+      requestType: "agent",
+      requestIp: "127.0.0.1",
+      agentName: "Recruit",
+      createdAgentId: agentId,
+    });
+
     // Control rows in a second company must survive the scoped delete.
     const otherCompanyId = randomUUID();
     const otherAgentId = randomUUID();
@@ -417,6 +589,19 @@ describeEmbeddedPostgres("company delete cascade", () => {
     await expect(db.select().from(projects).where(eq(projects.companyId, companyId))).resolves.toHaveLength(0);
     await expect(db.select().from(issues).where(eq(issues.companyId, companyId))).resolves.toHaveLength(0);
     await expect(db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).resolves.toHaveLength(0);
+    await expect(
+      db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.companyId, companyId)),
+    ).resolves.toHaveLength(0);
+    await expect(
+      db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId)),
+    ).resolves.toHaveLength(0);
+    await expect(
+      db.select().from(agentTaskSessions).where(eq(agentTaskSessions.companyId, companyId)),
+    ).resolves.toHaveLength(0);
+    await expect(db.select().from(agentApiKeys).where(eq(agentApiKeys.companyId, companyId))).resolves.toHaveLength(0);
+    await expect(
+      db.select().from(agentRuntimeState).where(eq(agentRuntimeState.companyId, companyId)),
+    ).resolves.toHaveLength(0);
     await expect(db.select().from(costEvents).where(eq(costEvents.companyId, companyId))).resolves.toHaveLength(0);
     await expect(db.select().from(financeEvents).where(eq(financeEvents.companyId, companyId))).resolves.toHaveLength(0);
     await expect(db.select().from(activityLog).where(eq(activityLog.companyId, companyId))).resolves.toHaveLength(0);
@@ -434,7 +619,13 @@ describeEmbeddedPostgres("company delete cascade", () => {
     await expect(db.select().from(feedbackVotes).where(eq(feedbackVotes.companyId, companyId))).resolves.toHaveLength(0);
     await expect(db.select().from(feedbackExports).where(eq(feedbackExports.companyId, companyId))).resolves.toHaveLength(0);
     await expect(db.select().from(issueWatchdogs).where(eq(issueWatchdogs.companyId, companyId))).resolves.toHaveLength(0);
+    await expect(
+      db.select().from(issueExecutionDecisions).where(eq(issueExecutionDecisions.companyId, companyId)),
+    ).resolves.toHaveLength(0);
     await expect(db.select().from(approvals).where(eq(approvals.companyId, companyId))).resolves.toHaveLength(0);
+    await expect(
+      db.select().from(approvalComments).where(eq(approvalComments.companyId, companyId)),
+    ).resolves.toHaveLength(0);
     await expect(db.select().from(budgetPolicies).where(eq(budgetPolicies.companyId, companyId))).resolves.toHaveLength(0);
     await expect(db.select().from(budgetIncidents).where(eq(budgetIncidents.companyId, companyId))).resolves.toHaveLength(0);
     await expect(db.select().from(companySkills).where(eq(companySkills.companyId, companyId))).resolves.toHaveLength(0);
@@ -457,6 +648,10 @@ describeEmbeddedPostgres("company delete cascade", () => {
       db.select().from(agentConfigRevisions).where(eq(agentConfigRevisions.companyId, companyId)),
     ).resolves.toHaveLength(0);
     await expect(db.select().from(routines).where(eq(routines.companyId, companyId))).resolves.toHaveLength(0);
+    await expect(db.select().from(assets).where(eq(assets.companyId, companyId))).resolves.toHaveLength(0);
+    await expect(db.select().from(companyLogos).where(eq(companyLogos.companyId, companyId))).resolves.toHaveLength(0);
+    await expect(db.select().from(invites).where(eq(invites.companyId, companyId))).resolves.toHaveLength(0);
+    await expect(db.select().from(joinRequests).where(eq(joinRequests.companyId, companyId))).resolves.toHaveLength(0);
 
     // The unrelated company's rows are untouched.
     await expect(db.select().from(companies).where(eq(companies.id, otherCompanyId))).resolves.toHaveLength(1);
@@ -466,4 +661,116 @@ describeEmbeddedPostgres("company delete cascade", () => {
       db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.companyId, otherCompanyId)),
     ).resolves.toHaveLength(1);
   }, 30_000);
+
+  // The fixture above can only exercise FK paths somebody remembered to seed.
+  // These three tests pin the delete order against the LIVE schema instead, so
+  // a migration that adds a table or FK the sequence does not handle fails CI
+  // even when no fixture row hits it (the way company_skill_test_runs slipped
+  // through the 2026.7 rebase and broke issue deletes).
+
+  it("covers every blocking company reference with the delete sequence", async () => {
+    const sequenceNames = COMPANY_DELETE_SEQUENCE.map((table) => getTableName(table));
+    const sequenced = new Set(sequenceNames);
+
+    // The sequence itself must be duplicate-free and made of real tables —
+    // otherwise the graph checks below would silently validate a phantom order.
+    expect(sequenceNames.length).toBe(sequenced.size);
+    const liveTables = await loadPublicTableNames(db);
+    expect(sequenceNames.filter((name) => !liveTables.has(name))).toEqual([]);
+
+    // CASCADE company FKs are emptied by the final companies delete and
+    // SET NULL / SET DEFAULT ones cannot block it, so only NO ACTION /
+    // RESTRICT references demand an explicit slot in the sequence.
+    const edges = await loadPublicFkGraph(db);
+    const uncovered = edges
+      .filter((edge) => edge.parentTable === "companies")
+      .filter((edge) => edge.onDelete === "no action" || edge.onDelete === "restrict")
+      .filter((edge) => !sequenced.has(edge.childTable))
+      .map(
+        (edge) =>
+          `${edge.childTable}.${edge.childColumns} -> companies is ON DELETE ${edge.onDelete.toUpperCase()} ` +
+          `(${edge.constraintName}) but ${edge.childTable} is not in COMPANY_DELETE_SEQUENCE`,
+      );
+    expect(uncovered).toEqual([]);
+  });
+
+  it("orders every blocking FK edge child-before-parent within the sequence", async () => {
+    const sequenceNames = COMPANY_DELETE_SEQUENCE.map((table) => getTableName(table));
+    const position = new Map<string, number>(sequenceNames.map((name, index) => [name, index]));
+    position.set("companies", sequenceNames.length); // the companies row goes last
+
+    const edges = await loadPublicFkGraph(db);
+    const misordered = edges
+      .filter((edge) => edge.onDelete === "no action" || edge.onDelete === "restrict")
+      .filter((edge) => edge.childTable !== edge.parentTable)
+      .filter((edge) => position.has(edge.childTable) && position.has(edge.parentTable))
+      .filter((edge) => (position.get(edge.childTable) ?? 0) > (position.get(edge.parentTable) ?? 0))
+      .map(
+        (edge) =>
+          `${edge.childTable}.${edge.childColumns} -> ${edge.parentTable} (${edge.onDelete}; ${edge.constraintName}): ` +
+          `${edge.childTable} must be deleted before ${edge.parentTable}`,
+      );
+    expect(misordered).toEqual([]);
+  });
+
+  it("replays the delete sequence against the live FK graph without hitting a blocking edge", async () => {
+    const edges = await loadPublicFkGraph(db);
+    const childEdgesByParent = new Map<string, FkEdge[]>();
+    for (const edge of edges) {
+      const list = childEdgesByParent.get(edge.parentTable) ?? [];
+      list.push(edge);
+      childEdgesByParent.set(edge.parentTable, list);
+    }
+
+    const deleteOrder = [...COMPANY_DELETE_SEQUENCE.map((table) => getTableName(table)), "companies"];
+    const emptied = new Set<string>();
+    const violations = new Set<string>();
+    const setNullHazards = new Set<string>();
+
+    // Each step runs `DELETE FROM table WHERE company_id = :id` as ONE
+    // statement, so the tables reachable through ON DELETE CASCADE edges are
+    // emptied within that same statement and Postgres checks NO ACTION
+    // constraints only after it completes. A blocking edge is therefore safe
+    // when its child dies in the same statement's cascade closure or was
+    // emptied by an earlier step — anything else is the exact FK error the
+    // production 500 threw.
+    for (const stepTable of deleteOrder) {
+      const closure = new Set<string>([stepTable]);
+      const pending = [stepTable];
+      while (pending.length > 0) {
+        const table = pending.pop()!;
+        for (const edge of childEdgesByParent.get(table) ?? []) {
+          if (edge.onDelete === "cascade" && !closure.has(edge.childTable)) {
+            closure.add(edge.childTable);
+            pending.push(edge.childTable);
+          }
+        }
+      }
+
+      for (const table of closure) {
+        for (const edge of childEdgesByParent.get(table) ?? []) {
+          if (edge.onDelete === "cascade" || edge.onDelete === "set default") continue;
+          if (edge.onDelete === "set null") {
+            if (edge.anyChildColumnNotNull) {
+              setNullHazards.add(
+                `${edge.childTable}.${edge.childColumns} -> ${table} is ON DELETE SET NULL onto a NOT NULL column (${edge.constraintName})`,
+              );
+            }
+            continue;
+          }
+          if (closure.has(edge.childTable) || emptied.has(edge.childTable)) continue;
+          violations.add(
+            `step "${stepTable}" (deleting ${table}) violates ${edge.constraintName}: ` +
+            `${edge.childTable}.${edge.childColumns} (${edge.onDelete}) is not emptied by any earlier step ` +
+            `or by this statement's cascade`,
+          );
+        }
+      }
+
+      for (const table of closure) emptied.add(table);
+    }
+
+    expect([...violations]).toEqual([]);
+    expect([...setNullHazards]).toEqual([]);
+  });
 });
