@@ -20,6 +20,11 @@ import {
 import { badRequest, forbidden } from "../errors.js";
 import { validate } from "../middleware/validate.js";
 import {
+  findIdempotentCompanyId,
+  readIdempotencyKeyHeader,
+  recordCompanyCreateIdempotencyKey,
+} from "../lib/create-idempotency.js";
+import {
   accessService,
   agentService,
   budgetService,
@@ -377,6 +382,19 @@ export function companyRoutes(db: Db, storage?: StorageService) {
       throw forbidden("Instance admin required");
     }
     const ownerPrincipalId = req.actor.userId ?? "local-board";
+
+    const idempotencyKey = readIdempotencyKeyHeader(req);
+    if (idempotencyKey) {
+      const existingCompanyId = await findIdempotentCompanyId(db, ownerPrincipalId, idempotencyKey);
+      if (existingCompanyId) {
+        const existingCompany = await svc.getById(existingCompanyId);
+        if (existingCompany) {
+          res.status(201).json(existingCompany);
+          return;
+        }
+      }
+    }
+
     const company = await svc.create({
       ...req.body,
       defaultResponsibleUserId: req.body.defaultResponsibleUserId ?? ownerPrincipalId,
@@ -408,6 +426,9 @@ export function companyRoutes(db: Db, storage?: StorageService) {
         },
         req.actor.userId ?? "board",
       );
+    }
+    if (idempotencyKey) {
+      await recordCompanyCreateIdempotencyKey(db, ownerPrincipalId, idempotencyKey, company.id);
     }
     res.status(201).json(company);
   });

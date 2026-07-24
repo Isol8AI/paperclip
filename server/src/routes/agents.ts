@@ -37,6 +37,11 @@ import {
 import { trackAgentCreated } from "@paperclipai/shared/telemetry";
 import { validate } from "../middleware/validate.js";
 import {
+  findIdempotentAgentId,
+  readIdempotencyKeyHeader,
+  recordAgentCreateIdempotencyKey,
+} from "../lib/create-idempotency.js";
+import {
   agentService,
   agentInstructionsService,
   accessService,
@@ -2534,6 +2539,19 @@ export function agentRoutes(
       res.status(404).json({ error: "Company not found" });
       return;
     }
+
+    const idempotencyKey = readIdempotencyKeyHeader(req);
+    if (idempotencyKey) {
+      const existingAgentId = await findIdempotentAgentId(db, companyId, idempotencyKey);
+      if (existingAgentId) {
+        const existingAgent = await svc.getById(existingAgentId);
+        if (existingAgent) {
+          res.status(201).json(existingAgent);
+          return;
+        }
+      }
+    }
+
     if (company.requireBoardApprovalForNewAgents) {
       throw conflict(
         "Direct agent creation requires board approval. Use POST /api/companies/:companyId/agent-hires to create a pending hire approval.",
@@ -2637,6 +2655,10 @@ export function agentRoutes(
         },
         actor.actorType === "user" ? actor.actorId : null,
       );
+    }
+
+    if (idempotencyKey) {
+      await recordAgentCreateIdempotencyKey(db, companyId, idempotencyKey, agent.id);
     }
 
     res.status(201).json(agent);
