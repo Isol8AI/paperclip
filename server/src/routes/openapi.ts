@@ -834,6 +834,7 @@ const INSTANCE_ADMIN_OPERATIONS = new Set([
   "POST /api/admin/users/{userId}/promote-instance-admin",
   "POST /api/admin/users/{userId}/demote-instance-admin",
   "PUT /api/admin/users/{userId}/company-access",
+  "DELETE /api/admin/users/{userId}",
 ]);
 
 const CREATED_OPERATIONS = new Set([
@@ -5228,6 +5229,21 @@ registry.registerPath({
   summary: "Demote a user from instance admin",
   request: { params: z.object({ userId: z.string() }) },
   responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "delete",
+  path: "/api/admin/users/{userId}",
+  tags: ["admin"],
+  summary: "Hard-delete a user and its dependent access rows (admin)",
+  request: { params: z.object({ userId: z.string() }) },
+  responses: {
+    200: r.ok(),
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
+  },
 });
 
 // ─── Project workspace runtime ────────────────────────────────────────────────

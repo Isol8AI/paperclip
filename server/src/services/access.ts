@@ -1,6 +1,7 @@
 import { and, eq, inArray, ne, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
+  authUsers,
   companyMemberships,
   instanceUserRoles,
   issues,
@@ -436,6 +437,59 @@ export function accessService(db: Db) {
       .then((rows) => rows[0] ?? null);
   }
 
+  // Hard-deletes a Better Auth user (the "user" table row) plus the
+  // instance-level rows that reference it by a polymorphic, non-FK-constrained
+  // principal/user id: company_memberships, principal_permission_grants,
+  // instance_user_roles. Deleting these here (rather than relying on the
+  // database) is the point of this function -- Postgres has no FK to cascade
+  // through for them, so a bare `DELETE FROM "user"` leaves them dangling.
+  //
+  // Better Auth's own session/account rows, plus board_api_keys and
+  // cli_auth_challenges.approved_by_user_id, DO reference authUsers.id via a
+  // real FK (ON DELETE CASCADE / SET NULL -- see packages/db/src/schema/
+  // auth.ts, board_api_keys.ts, cli_auth_challenges.ts) so the final delete
+  // below removes/nulls those automatically; no explicit statement needed.
+  //
+  // Order mirrors COMPANY_DELETE_SEQUENCE's discipline (children before the
+  // row they reference), even though none of these edges are FK-enforced --
+  // it keeps the transaction's intent readable and matches this codebase's
+  // Drizzle conventions for scoped hard deletes.
+  async function deleteUser(userId: string, options: { actorUserId?: string | null } = {}) {
+    if (options.actorUserId && options.actorUserId === userId) {
+      throw conflict("You cannot delete your own account");
+    }
+
+    return db.transaction(async (tx) => {
+      const existing = await tx
+        .select({ id: authUsers.id, email: authUsers.email })
+        .from(authUsers)
+        .where(eq(authUsers.id, userId))
+        .then((rows) => rows[0] ?? null);
+      if (!existing) return null;
+
+      await tx
+        .delete(principalPermissionGrants)
+        .where(
+          and(
+            eq(principalPermissionGrants.principalType, "user"),
+            eq(principalPermissionGrants.principalId, userId),
+          ),
+        );
+      await tx
+        .delete(companyMemberships)
+        .where(
+          and(eq(companyMemberships.principalType, "user"), eq(companyMemberships.principalId, userId)),
+        );
+      await tx.delete(instanceUserRoles).where(eq(instanceUserRoles.userId, userId));
+
+      const rows = await tx
+        .delete(authUsers)
+        .where(eq(authUsers.id, userId))
+        .returning({ id: authUsers.id, email: authUsers.email });
+      return rows[0] ?? null;
+    });
+  }
+
   async function listUserCompanyAccess(userId: string) {
     return db
       .select()
@@ -796,6 +850,7 @@ export function accessService(db: Db) {
     updateMemberAndPermissions,
     promoteInstanceAdmin,
     demoteInstanceAdmin,
+    deleteUser,
     listUserCompanyAccess,
     setUserCompanyAccess,
     setPrincipalGrants,

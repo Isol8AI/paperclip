@@ -4854,5 +4854,19 @@ export function accessRoutes(
     }
   );
 
+  // Hard-deletes a Better Auth user so the same email can sign up again --
+  // instance-admin only (never reachable from a per-user board session; see
+  // the local assertInstanceAdmin() above, which re-checks instance-admin
+  // status against the database rather than trusting a stale actor claim).
+  router.delete("/admin/users/:userId", async (req, res) => {
+    await assertInstanceAdmin(req);
+    const userId = req.params.userId as string;
+    const deleted = await access.deleteUser(userId, {
+      actorUserId: req.actor.userId ?? null,
+    });
+    if (!deleted) throw notFound("User not found");
+    res.json({ ok: true, id: deleted.id, email: deleted.email });
+  });
+
   return router;
 }
