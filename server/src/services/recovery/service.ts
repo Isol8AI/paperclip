@@ -258,8 +258,13 @@ function readRecoveryRunErrorFamily(latestRun: LatestIssueRun) {
 function isProviderQuotaRecovery(latestRun: LatestIssueRun) {
   if (latestRun?.errorCode === "provider_quota") return true;
   if (readRecoveryRunErrorFamily(latestRun) === "provider_quota") return true;
-  if (latestRun?.errorCode !== "adapter_failed") return false;
-  return /(?:usage|rate|quota) limit|quota (?:exceeded|reset)|try again after/i.test(latestRun.error ?? "");
+  if (
+    latestRun?.errorCode !== "adapter_failed" &&
+    !OPENCLAW_GATEWAY_FAILURE_ERROR_CODES.has(latestRun?.errorCode ?? "")
+  ) {
+    return false;
+  }
+  return /(?:usage|rate|quota) limit|quota (?:exceeded|reset)|try again after|daily free limit reached/i.test(latestRun?.error ?? "");
 }
 
 function resolveStrandedRecoveryCause(
@@ -369,7 +374,27 @@ const CONTINUATION_RECOVERY_TRANSIENT_BASE_BACKOFF_MS = 60_000;
 export const PROVIDER_QUOTA_RECOVERY_DEFAULT_BACKOFF_MS = 60 * 60 * 1000;
 
 const PROVIDER_QUOTA_ERROR_RE =
-  /(?:you(?:'|’)ve hit your usage limit|usage limit(?: reached| exceeded)?|provider quota|quota (?:limit )?exceeded|model (?:is )?at capacity)/i;
+  /(?:you(?:'|’)ve hit your usage limit|usage limit(?: reached| exceeded)?|provider quota|quota (?:limit )?exceeded|model (?:is )?at capacity|daily free limit reached)/i;
+
+// A hard per-UTC-day budget cap (e.g. an upstream gate's "daily free limit
+// reached — resets at midnight UTC" denial). The message itself states the
+// reset, so recovery parks precisely at the next UTC midnight instead of the
+// generic quota backoff.
+const DAILY_BUDGET_CAP_ERROR_RE = /daily free limit reached/i;
+
+// The openclaw-gateway adapter classifies daily-cap denials itself (errorCode
+// "provider_quota" + retryNotBefore), but runs recorded by older adapter builds
+// still carry the raw gateway error codes with the denial text only in the
+// message. Let those reach the conservative provider-quota text matching so
+// they park too instead of re-waking into the hard cap.
+const OPENCLAW_GATEWAY_FAILURE_ERROR_CODES = new Set([
+  "openclaw_gateway_agent_error",
+  "openclaw_gateway_wait_error",
+]);
+
+function nextUtcMidnight(now: Date): Date {
+  return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1));
+}
 const CONFIGURATION_INCOMPLETE_ERROR_RE =
   /(?:model_not_found|model [^\n]{0,120} not found|missing (?:api )?(?:key|credentials?)|credentials? (?:are |is )?missing|no (?:api )?(?:key|credentials?) (?:was |were )?(?:found|configured|provided)|api key (?:is )?(?:not set|unavailable))/i;
 
@@ -450,16 +475,21 @@ export function classifyAdapterFailureForRecovery(
   latestRun: Pick<NonNullable<LatestIssueRun>, "error" | "errorCode" | "resultJson">,
   now = new Date(),
 ): AdapterFailureRecoveryClassification {
+  const gatewayFailure = OPENCLAW_GATEWAY_FAILURE_ERROR_CODES.has(latestRun.errorCode ?? "");
   if (
     latestRun.errorCode !== "adapter_failed" &&
     latestRun.errorCode !== "provider_quota" &&
-    latestRun.errorCode !== "configuration_incomplete"
+    latestRun.errorCode !== "configuration_incomplete" &&
+    !gatewayFailure
   ) {
     return null;
   }
   const resultJson = parseObject(latestRun.resultJson);
   const error = [latestRun.errorCode ?? "", latestRun.error ?? "", JSON.stringify(resultJson)].join("\n");
-  if (latestRun.errorCode === "configuration_incomplete" || CONFIGURATION_INCOMPLETE_ERROR_RE.test(error)) {
+  if (
+    !gatewayFailure &&
+    (latestRun.errorCode === "configuration_incomplete" || CONFIGURATION_INCOMPLETE_ERROR_RE.test(error))
+  ) {
     return { kind: "configuration_incomplete" };
   }
   if (latestRun.errorCode !== "provider_quota" && !PROVIDER_QUOTA_ERROR_RE.test(error)) return null;
@@ -475,6 +505,9 @@ export function classifyAdapterFailureForRecovery(
   const parsedClockReset = parseProviderQuotaClockReset(error, now);
   if (parsedClockReset) {
     return { kind: "provider_quota", retryAt: parsedClockReset, parsedResetTime: true };
+  }
+  if (DAILY_BUDGET_CAP_ERROR_RE.test(error)) {
+    return { kind: "provider_quota", retryAt: nextUtcMidnight(now), parsedResetTime: true };
   }
   return {
     kind: "provider_quota",
