@@ -759,4 +759,89 @@ describeEmbeddedPostgres("productivity review service", () => {
     const [review] = await listProductivityReviews(seeded.companyId);
     expect(review?.requestDepth).toBe(MAX_ISSUE_REQUEST_DEPTH);
   });
+
+  // A review is moot once its source issue is terminal. Without cleanup, a
+  // review parked in a non-terminal status (e.g. blocked on an unreachable
+  // corrective action) lingers forever as live-looking work.
+  it("cancels an open productivity review once its source issue reaches a terminal status", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    const reviewId = randomUUID();
+    const reviewCreatedAt = new Date(now.getTime() - 4 * 60 * 60 * 1000);
+    await db.insert(issues).values({
+      id: reviewId,
+      companyId: seeded.companyId,
+      title: "Review productivity for the import issue",
+      status: "blocked",
+      priority: "high",
+      assigneeAgentId: seeded.managerId,
+      originKind: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
+      originId: seeded.issueId,
+      originFingerprint: `productivity-review:${seeded.issueId}`,
+      parentId: seeded.issueId,
+      issueNumber: 2,
+      identifier: `${seeded.issuePrefix}-2`,
+      createdAt: reviewCreatedAt,
+      updatedAt: reviewCreatedAt,
+    });
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, seeded.issueId));
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.staleResolved).toBe(1);
+    expect(result.failed).toBe(0);
+
+    const review = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, reviewId))
+      .then((rows) => rows[0] ?? null);
+    expect(review?.status).toBe("cancelled");
+
+    const comments = await db
+      .select({ body: issueComments.body })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, reviewId));
+    expect(comments.some((row) => /terminal status/i.test(row.body ?? ""))).toBe(true);
+  });
+
+  // Reviews whose source is still live must be untouched by the stale sweep.
+  it("leaves open productivity reviews alone while their source issue is still active", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    const reviewId = randomUUID();
+    await db.insert(issues).values({
+      id: reviewId,
+      companyId: seeded.companyId,
+      title: "Review productivity for the import issue",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: seeded.managerId,
+      originKind: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
+      originId: seeded.issueId,
+      originFingerprint: `productivity-review:${seeded.issueId}`,
+      parentId: seeded.issueId,
+      issueNumber: 2,
+      identifier: `${seeded.issuePrefix}-2`,
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.staleResolved).toBe(0);
+
+    const review = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, reviewId))
+      .then((rows) => rows[0] ?? null);
+    expect(review?.status).toBe("todo");
+  });
 });

@@ -1,4 +1,5 @@
 import { and, asc, desc, eq, gt, gte, inArray, isNull, notInArray, sql } from "drizzle-orm";
+import { alias } from "drizzle-orm/pg-core";
 import type { Db } from "@paperclipai/db";
 import { clampIssueRequestDepth } from "@paperclipai/shared";
 import {
@@ -871,11 +872,81 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       snoozed: 0,
       creationCapped: 0,
       noActionSuppressed: 0,
+      staleResolved: 0,
       skipped: 0,
       failed: 0,
       reviewIssueIds: [] as string[],
       failedIssueIds: [] as string[],
     };
+
+    // Isol8 fork: a productivity review is moot once its source issue is
+    // terminal — the flagged pattern can no longer be acted on. Cancel any
+    // still-open review so it does not linger as live-looking work (e.g.
+    // parked `blocked` on a corrective action the reviewer could not take)
+    // after the reviewed work itself finished.
+    const staleSourceIssue = alias(issues, "productivity_review_source_issue");
+    const staleReviews = await db
+      .select({
+        id: issues.id,
+        companyId: issues.companyId,
+        assigneeAgentId: issues.assigneeAgentId,
+        originId: issues.originId,
+        sourceStatus: staleSourceIssue.status,
+      })
+      .from(issues)
+      .innerJoin(
+        staleSourceIssue,
+        and(
+          eq(staleSourceIssue.companyId, issues.companyId),
+          sql`${staleSourceIssue.id}::text = ${issues.originId}`,
+        ),
+      )
+      .where(
+        and(
+          opts?.companyId ? eq(issues.companyId, opts.companyId) : undefined,
+          eq(issues.originKind, PRODUCTIVITY_REVIEW_ORIGIN_KIND),
+          visibleIssueCondition(),
+          notInArray(issues.status, ["done", "cancelled"]),
+          inArray(staleSourceIssue.status, ["done", "cancelled"]),
+        ),
+      )
+      .limit(MAX_CANDIDATE_ISSUES);
+    for (const review of staleReviews) {
+      try {
+        const updated = await issuesSvc.update(review.id, { status: "cancelled" });
+        if (!updated) {
+          result.skipped += 1;
+          continue;
+        }
+        await issuesSvc.addComment(
+          review.id,
+          "The source issue reached a terminal status, so this productivity review was closed as moot.",
+          {},
+        );
+        await logActivity(db, {
+          companyId: review.companyId,
+          actorType: "system",
+          actorId: "system",
+          action: "issue.productivity_review_auto_resolved",
+          entityType: "issue",
+          entityId: review.id,
+          agentId: review.assigneeAgentId,
+          details: {
+            source: "productivity_review.reconcile",
+            sourceIssueId: review.originId,
+            sourceIssueStatus: review.sourceStatus,
+          },
+        });
+        result.staleResolved += 1;
+      } catch (err) {
+        result.failed += 1;
+        result.failedIssueIds.push(review.id);
+        logger.warn(
+          { err, companyId: review.companyId, issueId: review.id },
+          "productivity review stale-resolution failed",
+        );
+      }
+    }
 
     const prefixCache = new Map<string, string>();
     for (const candidate of candidates) {
