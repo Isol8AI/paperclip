@@ -536,28 +536,28 @@ export async function createApp(
     lifecycle,
     async (pluginId) => (await pluginRegistry.getById(pluginId))?.packagePath ?? null,
   );
-  // Auto-install the bundled kubernetes sandbox-provider plugin so the
-  // "kubernetes" sandbox provider is registered for agent runs. The plugin is
-  // excluded from the pnpm workspace and built standalone into the image (see
-  // Dockerfile), then installed here from its local path. This runs BEFORE
-  // loadAll() so loadAll() can activate it in the same startup pass.
+  // Auto-install bundled plugins from their in-image local paths. The
+  // kubernetes plugin is excluded from the pnpm workspace and built standalone
+  // into the image (see Dockerfile); the isol8 notifications forwarder is a
+  // regular workspace package shipped by the same image COPY. Both run BEFORE
+  // loadAll() so loadAll() can activate them in the same startup pass.
   //
   // SAFETY (invariant B): this is fully fail-safe. Any failure (missing path,
   // install error, load error) is caught, logged, and swallowed so the server
-  // ALWAYS finishes booting. A degraded boot (no kubernetes provider, agents
-  // cannot run) is strictly preferable to a crash loop.
-  const ensureBundledKubernetesPlugin = async (): Promise<void> => {
-    const KUBERNETES_PLUGIN_KEY = "paperclip.kubernetes-sandbox-provider";
-    const pluginPath =
-      process.env["PAPERCLIP_KUBERNETES_PLUGIN_PATH"] ??
-      "/app/packages/plugins/sandbox-providers/kubernetes";
+  // ALWAYS finishes booting. A degraded boot (no kubernetes provider / no
+  // outbound notifications) is strictly preferable to a crash loop.
+  const ensureBundledPlugin = async (
+    pluginKey: string,
+    pluginPath: string,
+    label: string,
+  ): Promise<void> => {
     try {
       // Idempotent: skip if already installed (any non-uninstalled status).
-      const existing = await pluginRegistry.getByKey(KUBERNETES_PLUGIN_KEY);
+      const existing = await pluginRegistry.getByKey(pluginKey);
       if (existing) {
         logger.info(
-          { pluginKey: KUBERNETES_PLUGIN_KEY, status: existing.status },
-          "kubernetes sandbox plugin already installed; skipping auto-install",
+          { pluginKey, status: existing.status },
+          `${label} plugin already installed; skipping auto-install`,
         );
         return;
       }
@@ -566,14 +566,14 @@ export async function createApp(
       if (!fs.existsSync(path.join(pluginPath, "dist", "manifest.js"))) {
         logger.info(
           { pluginPath },
-          "kubernetes sandbox plugin bundle not present; skipping auto-install",
+          `${label} plugin bundle not present; skipping auto-install`,
         );
         return;
       }
-      logger.info({ pluginPath }, "auto-installing bundled kubernetes sandbox plugin");
+      logger.info({ pluginPath }, `auto-installing bundled ${label} plugin`);
       const discovered = await loader.installPlugin({ localPath: pluginPath });
       if (!discovered.manifest) {
-        logger.error("kubernetes sandbox plugin installed but manifest is missing");
+        logger.error(`${label} plugin installed but manifest is missing`);
         return;
       }
       // Transition installed -> ready and activate the worker.
@@ -582,19 +582,34 @@ export async function createApp(
         await lifecycle.load(installed.id);
         logger.info(
           { pluginId: installed.id, pluginKey: installed.pluginKey },
-          "kubernetes sandbox plugin auto-installed and loaded",
+          `${label} plugin auto-installed and loaded`,
         );
       } else {
-        logger.error("kubernetes sandbox plugin installed but not found in registry");
+        logger.error(`${label} plugin installed but not found in registry`);
       }
     } catch (err) {
       logger.error(
         { err },
-        "Failed to auto-install the kubernetes sandbox plugin; continuing boot (degraded: kubernetes provider unavailable)",
+        `Failed to auto-install the ${label} plugin; continuing boot (degraded: ${label} unavailable)`,
       );
     }
   };
+  const ensureBundledKubernetesPlugin = () =>
+    ensureBundledPlugin(
+      "paperclip.kubernetes-sandbox-provider",
+      process.env["PAPERCLIP_KUBERNETES_PLUGIN_PATH"] ??
+        "/app/packages/plugins/sandbox-providers/kubernetes",
+      "kubernetes sandbox",
+    );
+  const ensureBundledIsol8NotificationsPlugin = () =>
+    ensureBundledPlugin(
+      "isol8.notifications",
+      process.env["PAPERCLIP_ISOL8_NOTIFICATIONS_PLUGIN_PATH"] ??
+        "/app/packages/plugins/plugin-isol8-notifications",
+      "isol8 notifications",
+    );
   void ensureBundledKubernetesPlugin()
+    .then(() => ensureBundledIsol8NotificationsPlugin())
     .then(() => loader.loadAll())
     .then((result) => {
     if (!result) return;
