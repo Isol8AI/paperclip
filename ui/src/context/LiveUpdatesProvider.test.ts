@@ -791,3 +791,68 @@ describe("LiveUpdatesProvider run lifecycle toasts", () => {
     });
   });
 });
+
+describe("LiveUpdatesProvider approval and verification toasts", () => {
+  it("builds a distinct warning toast for confirmation interactions", () => {
+    const queryClient = {
+      getQueryData: (key: unknown) => {
+        if (JSON.stringify(key) === JSON.stringify(queryKeys.issues.detail("PAP-67"))) {
+          return {
+            id: "issue-1",
+            identifier: "PAP-67",
+            title: "Mobile App Approvals",
+          };
+        }
+        return undefined;
+      },
+    };
+
+    expect(
+      __liveUpdatesTestUtils.buildActivityToast(
+        queryClient as never,
+        "company-1",
+        {
+          entityType: "issue",
+          entityId: "issue-1",
+          action: "issue.thread_interaction_created",
+          actorType: "agent",
+          actorId: "agent-1",
+          details: {
+            identifier: "PAP-67",
+            interactionId: "interaction-1",
+            interactionKind: "request_confirmation",
+          },
+        },
+        { userId: "user-1", agentId: null },
+      ),
+    ).toMatchObject({
+      title: "Human verification needed on PAP-67",
+      body: "A run is waiting for confirmation before it can continue. Mobile App Approvals",
+      tone: "warn",
+      action: { label: "Review PAP-67", href: "/issues/PAP-67" },
+      dedupeKey: "activity:issue.thread_interaction_created:issue-1:interaction-1",
+    });
+  });
+
+  it("builds a separate warning toast for approval requests", () => {
+    expect(
+      __liveUpdatesTestUtils.buildActivityToast(
+        { getQueryData: () => undefined } as never,
+        "company-1",
+        {
+          entityType: "approval",
+          entityId: "approval-1",
+          action: "approval.created",
+          details: { type: "shell_command" },
+        },
+        { userId: "user-1", agentId: null },
+      ),
+    ).toMatchObject({
+      title: "Approval needed",
+      body: "A shell command approval is waiting for review.",
+      tone: "warn",
+      action: { label: "Review approval", href: "/approvals/approval-1" },
+      dedupeKey: "activity:approval.created:approval-1",
+    });
+  });
+});

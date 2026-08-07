@@ -408,7 +408,12 @@ async function hydrateVisibleIssueComment(
   }
 }
 
-const ISSUE_TOAST_ACTIONS = new Set(["issue.created", "issue.updated", "issue.comment_added"]);
+const ISSUE_TOAST_ACTIONS = new Set([
+  "issue.created",
+  "issue.updated",
+  "issue.comment_added",
+  "issue.thread_interaction_created",
+]);
 const ISSUE_DOCUMENT_ACTIVITY_ACTIONS = new Set([
   "issue.document_created",
   "issue.document_updated",
@@ -438,6 +443,80 @@ function describeIssueUpdate(details: Record<string, unknown> | null): string | 
   return null;
 }
 
+function describeInteractionNotification(kind: string | null): { title: string; body: string; tone: ToastInput["tone"] } {
+  switch (kind) {
+    case "request_confirmation":
+      return {
+        title: "Human verification needed",
+        body: "A run is waiting for confirmation before it can continue.",
+        tone: "warn",
+      };
+    case "request_checkbox_confirmation":
+      return {
+        title: "Checklist confirmation needed",
+        body: "A run is waiting for checklist verification.",
+        tone: "warn",
+      };
+    case "ask_user_questions":
+      return {
+        title: "Answer needed",
+        body: "A run asked a question and is waiting for a reply.",
+        tone: "info",
+      };
+    case "suggest_tasks":
+      return {
+        title: "Task review needed",
+        body: "A run suggested follow-up tasks for review.",
+        tone: "info",
+      };
+    default:
+      return {
+        title: "Review needed",
+        body: "A run is waiting for human input before it can continue.",
+        tone: "info",
+      };
+  }
+}
+
+function buildIssueThreadInteractionToast(
+  queryClient: QueryClient,
+  companyId: string,
+  entityId: string,
+  details: Record<string, unknown> | null,
+): ToastInput {
+  const issue = resolveIssueToastContext(queryClient, companyId, entityId, details);
+  const interactionId = readString(details?.interactionId) ?? "na";
+  const interactionKind = readString(details?.interactionKind);
+  const notification = describeInteractionNotification(interactionKind);
+
+  return {
+    title: `${notification.title} on ${issue.ref}`,
+    body: truncate(`${notification.body}${issue.title ? ` ${issue.title}` : ""}`, 120),
+    tone: notification.tone,
+    ttlMs: 12_000,
+    action: { label: `Review ${issue.ref}`, href: issue.href },
+    dedupeKey: `activity:issue.thread_interaction_created:${entityId}:${interactionId}`,
+  };
+}
+
+function buildApprovalToast(payload: Record<string, unknown>): ToastInput | null {
+  const entityType = readString(payload.entityType);
+  const action = readString(payload.action);
+  const entityId = readString(payload.entityId);
+  const details = readRecord(payload.details);
+  if (entityType !== "approval" || action !== "approval.created" || !entityId) return null;
+
+  const approvalType = readString(details?.type)?.replace(/_/g, " ");
+  return {
+    title: "Approval needed",
+    body: approvalType ? `A ${approvalType} approval is waiting for review.` : "A run is waiting for approval.",
+    tone: "warn",
+    ttlMs: 12_000,
+    action: { label: "Review approval", href: `/approvals/${entityId}` },
+    dedupeKey: `activity:approval.created:${entityId}`,
+  };
+}
+
 function buildActivityToast(
   queryClient: QueryClient,
   companyId: string,
@@ -451,6 +530,9 @@ function buildActivityToast(
   const actorId = readString(payload.actorId);
   const actorType = readString(payload.actorType);
 
+  const approvalToast = buildApprovalToast(payload);
+  if (approvalToast) return approvalToast;
+
   if (entityType !== "issue" || !entityId || !action || !ISSUE_TOAST_ACTIONS.has(action)) {
     return null;
   }
@@ -461,6 +543,10 @@ function buildActivityToast(
     (actorType === "user" && !!currentActor.userId && actorId === currentActor.userId) ||
     (actorType === "agent" && !!currentActor.agentId && actorId === currentActor.agentId);
   if (isSelfActivity) return null;
+
+  if (action === "issue.thread_interaction_created") {
+    return buildIssueThreadInteractionToast(queryClient, companyId, entityId, details);
+  }
 
   if (action === "issue.created") {
     return {
@@ -658,6 +744,15 @@ function invalidateActivityQueries(
     const targetUserId = readString(details?.userId);
     if (!targetUserId || targetUserId === currentActor.userId) {
       queryClient.invalidateQueries({ queryKey: queryKeys.resourceMemberships.mine(companyId) });
+    }
+  }
+
+  if (entityType === "approval") {
+    queryClient.invalidateQueries({ queryKey: queryKeys.approvals.list(companyId) });
+    queryClient.invalidateQueries({ queryKey: queryKeys.approvals.list(companyId, "pending") });
+    if (entityId) {
+      queryClient.invalidateQueries({ queryKey: queryKeys.approvals.detail(entityId) });
+      queryClient.invalidateQueries({ queryKey: queryKeys.approvals.issues(entityId) });
     }
   }
 
@@ -915,6 +1010,7 @@ function closeSocketQuietly(target: LiveUpdatesSocketLike | null, reason: string
 
 export const __liveUpdatesTestUtils = {
   buildAgentStatusToast,
+  buildActivityToast,
   buildRunStatusToast,
   closeSocketQuietly,
   hydrateVisibleIssueComment,
