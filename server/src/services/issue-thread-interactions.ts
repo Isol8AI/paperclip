@@ -2,9 +2,11 @@ import { isDeepStrictEqual } from "node:util";
 import { and, asc, eq, inArray, isNotNull } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
+  approvals,
   documents,
   heartbeatRuns,
   issueComments,
+  issueApprovals,
   issueDocuments,
   issueThreadInteractions,
   issues,
@@ -44,6 +46,14 @@ import { issueService, listUnfinalizedExecutionWorkspaceIds } from "./issues.js"
 type InteractionActor = {
   agentId?: string | null;
   userId?: string | null;
+  runId?: string | null;
+};
+
+type OwnerAuthorizationProvenance = {
+  approvalId: string;
+  decidedByUserId: string;
+  decidedAt: Date;
+  decisionNote?: string | null;
 };
 
 const ISSUE_THREAD_INTERACTION_IDEMPOTENCY_CONSTRAINT =
@@ -584,11 +594,53 @@ export function issueThreadInteractionService(db: Db) {
     return current;
   }
 
+  async function resolveOwnerAuthorizationProvenance(args: {
+    issue: { id: string; companyId: string };
+    approvalId?: string | null;
+  }): Promise<OwnerAuthorizationProvenance | null> {
+    if (!args.approvalId) return null;
+
+    const row = await db
+      .select({
+        approvalId: approvals.id,
+        approvalCompanyId: approvals.companyId,
+        status: approvals.status,
+        decidedByUserId: approvals.decidedByUserId,
+        decidedAt: approvals.decidedAt,
+        decisionNote: approvals.decisionNote,
+        linkedIssueId: issueApprovals.issueId,
+      })
+      .from(approvals)
+      .innerJoin(issueApprovals, eq(issueApprovals.approvalId, approvals.id))
+      .where(and(
+        eq(approvals.id, args.approvalId),
+        eq(approvals.companyId, args.issue.companyId),
+        eq(issueApprovals.companyId, args.issue.companyId),
+        eq(issueApprovals.issueId, args.issue.id),
+      ))
+      .then((rows) => rows[0] ?? null);
+
+    if (!row) {
+      throw unprocessable("ownerAuthorization.approvalId must reference an approval linked to this issue");
+    }
+    if (row.status !== "approved" || !row.decidedByUserId || !row.decidedAt) {
+      throw unprocessable("ownerAuthorization.approvalId must reference a board-approved approval");
+    }
+
+    return {
+      approvalId: row.approvalId,
+      decidedByUserId: row.decidedByUserId,
+      decidedAt: row.decidedAt,
+      decisionNote: row.decisionNote ?? null,
+    };
+  }
+
   async function acceptRequestConfirmation(args: {
     issue: { id: string; companyId: string };
     current: IssueThreadInteractionRow;
     input: AcceptIssueThreadInteraction;
     actor: InteractionActor;
+    ownerAuthorization?: OwnerAuthorizationProvenance | null;
   }): Promise<{
     interaction: IssueThreadInteraction;
     continuationIssue: IssueWakeTarget | null;
@@ -620,9 +672,20 @@ export function issueThreadInteractionService(db: Db) {
             version: 1,
             outcome: "accepted",
             ...(selectedOptionIds ? { selectedOptionIds } : {}),
+            ...(args.ownerAuthorization
+              ? {
+                  ownerAuthorization: {
+                    approvalId: args.ownerAuthorization.approvalId,
+                    decidedByUserId: args.ownerAuthorization.decidedByUserId,
+                    decidedAt: args.ownerAuthorization.decidedAt.toISOString(),
+                    decisionNote: args.ownerAuthorization.decisionNote ?? null,
+                  },
+                }
+              : {}),
           },
           resolvedByAgentId: args.actor.agentId ?? null,
           resolvedByUserId: args.actor.userId ?? null,
+          resolvedByRunId: args.actor.runId ?? null,
           resolvedAt: now,
           updatedAt: now,
         })
@@ -863,8 +926,15 @@ export function issueThreadInteractionService(db: Db) {
     ): Promise<ResolvedInteractionResult> => {
       const data = acceptIssueThreadInteractionSchema.parse(input);
       const current = await getPendingInteractionForResolution({ issue, interactionId });
+      const ownerAuthorization = await resolveOwnerAuthorizationProvenance({
+        issue,
+        approvalId: data.ownerAuthorization?.approvalId ?? null,
+      });
       switch (current.kind) {
         case "suggest_tasks":
+          if (ownerAuthorization) {
+            throw unprocessable("ownerAuthorization is only supported for request confirmation interactions");
+          }
           // Accepting suggest_tasks only creates follow-up issues; it does not
           // approve code state or move the source workspace forward, so the
           // workspace_finalize gate (PAPA-440) does not apply here.
@@ -876,6 +946,7 @@ export function issueThreadInteractionService(db: Db) {
             current,
             input: data,
             actor,
+            ownerAuthorization,
           });
           return {
             interaction: accepted.interaction,
@@ -890,6 +961,7 @@ export function issueThreadInteractionService(db: Db) {
             current,
             input: data,
             actor,
+            ownerAuthorization,
           });
           return {
             interaction: accepted.interaction,

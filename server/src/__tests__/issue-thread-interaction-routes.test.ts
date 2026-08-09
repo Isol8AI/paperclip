@@ -7,6 +7,7 @@ const CREATED_AGENT_ID = "22222222-2222-4222-8222-222222222222";
 
 const mockIssueService = vi.hoisted(() => ({
   getById: vi.fn(),
+  assertCheckoutOwner: vi.fn(),
 }));
 
 const mockInteractionService = vi.hoisted(() => ({
@@ -180,6 +181,7 @@ describe.sequential("issue thread interaction routes", () => {
     registerModuleMocks();
     vi.clearAllMocks();
     mockIssueService.getById.mockResolvedValue(createIssue());
+    mockIssueService.assertCheckoutOwner.mockResolvedValue({ adoptedFromRunId: null });
     mockInteractionService.listForIssue.mockResolvedValue([]);
     mockInteractionService.expireRequestConfirmationsSupersededByHistoricalComments.mockResolvedValue([]);
     mockInteractionService.create.mockResolvedValue({
@@ -543,6 +545,87 @@ describe.sequential("issue thread interaction routes", () => {
           interactionKind: "request_confirmation",
           interactionStatus: "accepted",
         }),
+      }),
+    );
+  });
+
+  it("keeps generic agent accept blocked for board-only interactions", async () => {
+    const app = await createApp({
+      type: "agent",
+      agentId: ASSIGNEE_AGENT_ID,
+      companyId: "company-1",
+      runId: "33333333-3333-4333-8333-333333333333",
+      source: "agent_key",
+    });
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-3/accept")
+      .send({});
+
+    expect(res.status).toBe(403);
+    expect(res.body).toEqual({ error: "This issue-thread interaction is board-only" });
+    expect(mockInteractionService.acceptInteraction).not.toHaveBeenCalled();
+  });
+
+  it("allows agent accept with owner authorization provenance and passes the resolving run id", async () => {
+    mockInteractionService.acceptInteraction.mockResolvedValueOnce({
+      interaction: {
+        id: "interaction-owner-approved",
+        companyId: "company-1",
+        issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        kind: "request_confirmation",
+        status: "accepted",
+        continuationPolicy: "wake_assignee",
+        idempotencyKey: null,
+        sourceCommentId: null,
+        sourceRunId: "run-3",
+        payload: {
+          version: 1,
+          prompt: "Apply this plan?",
+        },
+        result: {
+          version: 1,
+          outcome: "accepted",
+          ownerAuthorization: {
+            approvalId: "44444444-4444-4444-8444-444444444444",
+            decidedByUserId: "owner-user",
+            decidedAt: "2026-08-09T04:00:00.000Z",
+          },
+        },
+        resolvedByAgentId: ASSIGNEE_AGENT_ID,
+        resolvedByRunId: "33333333-3333-4333-8333-333333333333",
+        createdAt: "2026-04-20T12:00:00.000Z",
+        updatedAt: "2026-04-20T12:05:00.000Z",
+        resolvedAt: "2026-04-20T12:05:00.000Z",
+      },
+      createdIssues: [],
+    });
+    const app = await createApp({
+      type: "agent",
+      agentId: ASSIGNEE_AGENT_ID,
+      companyId: "company-1",
+      runId: "33333333-3333-4333-8333-333333333333",
+      source: "agent_key",
+    });
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-owner-approved/accept")
+      .send({ ownerAuthorization: { approvalId: "44444444-4444-4444-8444-444444444444" } });
+
+    expect(res.status).toBe(200);
+    expect(mockIssueService.assertCheckoutOwner).toHaveBeenCalledWith(
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      ASSIGNEE_AGENT_ID,
+      "33333333-3333-4333-8333-333333333333",
+    );
+    expect(mockInteractionService.acceptInteraction).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" }),
+      "interaction-owner-approved",
+      { ownerAuthorization: { approvalId: "44444444-4444-4444-8444-444444444444" } },
+      expect.objectContaining({
+        agentId: ASSIGNEE_AGENT_ID,
+        runId: "33333333-3333-4333-8333-333333333333",
+        userId: null,
       }),
     );
   });

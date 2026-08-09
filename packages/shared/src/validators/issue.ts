@@ -850,6 +850,12 @@ export const requestConfirmationResultSchema = z.object({
   reason: z.string().trim().max(4000).nullable().optional(),
   commentId: z.string().uuid().nullable().optional(),
   staleTarget: requestConfirmationTargetSchema.nullable().optional(),
+  ownerAuthorization: z.object({
+    approvalId: z.string().uuid(),
+    decidedByUserId: z.string().trim().min(1).max(200),
+    decidedAt: z.union([z.string().datetime(), z.date()]),
+    decisionNote: z.string().trim().max(4000).nullable().optional(),
+  }).nullable().optional(),
 });
 
 export const requestCheckboxConfirmationResultSchema = requestConfirmationResultSchema.extend({
@@ -921,6 +927,9 @@ export const acceptIssueThreadInteractionSchema = z.object({
   selectedOptionIds: z.array(z.string().trim().min(1).max(120))
     .max(REQUEST_CHECKBOX_CONFIRMATION_OPTION_LIMIT)
     .optional(),
+  ownerAuthorization: z.object({
+    approvalId: z.string().uuid(),
+  }).optional(),
 }).superRefine((value, ctx) => {
   const seenClientKeys = new Set<string>();
   for (const [index, clientKey] of (value.selectedClientKeys ?? []).entries()) {

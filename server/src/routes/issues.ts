@@ -2107,7 +2107,11 @@ export function issueRoutes(
     issue: {
       id: string;
       companyId: string;
-      parentId?: string | null;
+      projectId: string | null;
+      parentId: string | null;
+      status: string;
+      assigneeAgentId: string | null;
+      assigneeUserId: string | null;
     },
     opts: { allowWatchdogIssue?: boolean } = {},
   ) {
@@ -2132,17 +2136,35 @@ export function issueRoutes(
     issue: {
       id: string;
       companyId: string;
-      parentId?: string | null;
+      projectId: string | null;
+      parentId: string | null;
+      status: string;
+      assigneeAgentId: string | null;
+      assigneeUserId: string | null;
     },
+    options?: { allowOwnerAuthorization?: boolean },
   ) {
     if (req.actor.type !== "agent") return false;
+    const ownerApprovalId = typeof req.body?.ownerAuthorization?.approvalId === "string"
+      ? req.body.ownerAuthorization.approvalId.trim()
+      : "";
+    if (options?.allowOwnerAuthorization && ownerApprovalId) {
+      if (!req.actor.runId) {
+        res.status(403).json({ error: "Owner-authorized issue-thread resolution requires a heartbeat run id" });
+        return true;
+      }
+      if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return true;
+      if (await assertLowTrustControlPlaneDenied(req, res, issue.companyId, issue)) return true;
+      if (!(await assertTaskWatchdogIssueMutationAllowed(req, res, issue, { allowWatchdogIssue: false }))) return true;
+      return false;
+    }
     if (
       req.actor.runId &&
       !(await assertTaskWatchdogIssueMutationAllowed(req, res, issue, { allowWatchdogIssue: false }))
     ) {
       return true;
     }
-    res.status(403).json({ error: "Agent actors cannot resolve issue-thread interactions through this board-only route" });
+    res.status(403).json({ error: "This issue-thread interaction is board-only" });
     return true;
   }
 
@@ -6858,13 +6880,14 @@ export function issueRoutes(
         return;
       }
       assertCompanyAccess(req, issue.companyId);
-      if (await rejectAgentIssueThreadInteractionResolution(req, res, issue)) return;
-      assertBoard(req);
+      if (await rejectAgentIssueThreadInteractionResolution(req, res, issue, { allowOwnerAuthorization: true })) return;
+      if (req.actor.type !== "agent") assertBoard(req);
 
       const actor = getActorInfo(req);
       const { interaction, createdIssues, continuationIssue } = await issueThreadInteractionService(db).acceptInteraction(issue, interactionId, req.body, {
         agentId: actor.agentId,
         userId: actor.actorType === "user" ? actor.actorId : null,
+        runId: actor.runId,
       });
       const continuationWakeIssue = continuationIssue ?? issue;
 

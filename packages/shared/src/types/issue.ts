@@ -700,6 +700,14 @@ export interface IssueThreadInteractionActorFields {
   createdByUserId?: string | null;
   resolvedByAgentId?: string | null;
   resolvedByUserId?: string | null;
+  resolvedByRunId?: string | null;
+}
+
+export interface IssueThreadInteractionOwnerAuthorizationProvenance {
+  approvalId: string;
+  decidedByUserId: string;
+  decidedAt: Date | string;
+  decisionNote?: string | null;
 }
 
 export interface SuggestedTaskDraft {
@@ -845,6 +853,7 @@ export interface RequestConfirmationResult {
   reason?: string | null;
   commentId?: string | null;
   staleTarget?: RequestConfirmationTarget | null;
+  ownerAuthorization?: IssueThreadInteractionOwnerAuthorizationProvenance | null;
 }
 
 export interface RequestCheckboxConfirmationResult extends RequestConfirmationResult {

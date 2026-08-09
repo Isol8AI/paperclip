@@ -28,6 +28,7 @@ export const issueThreadInteractions = pgTable(
     createdByUserId: text("created_by_user_id"),
     resolvedByAgentId: uuid("resolved_by_agent_id").references(() => agents.id),
     resolvedByUserId: text("resolved_by_user_id"),
+    resolvedByRunId: uuid("resolved_by_run_id").references(() => heartbeatRuns.id, { onDelete: "set null" }),
     payload: jsonb("payload").$type<IssueThreadInteractionPayload>().notNull(),
     result: jsonb("result").$type<IssueThreadInteractionResult>(),
     resolvedAt: timestamp("resolved_at", { withTimezone: true }),

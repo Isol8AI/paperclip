@@ -3,6 +3,7 @@ import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   agents,
+  approvals,
   companies,
   createDb,
   documentRevisions,
@@ -11,6 +12,7 @@ import {
   goals,
   heartbeatRuns,
   issueComments,
+  issueApprovals,
   issueDocuments,
   instanceSettings,
   issueRelations,
@@ -51,6 +53,8 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     await db.delete(documentRevisions);
     await db.delete(documents);
     await db.delete(issueRelations);
+    await db.delete(issueApprovals);
+    await db.delete(approvals);
     await db.delete(heartbeatRuns);
     await db.delete(workspaceOperations);
     await db.delete(issues);
@@ -744,6 +748,118 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     }, requiresReason.id, {}, {
       userId: "local-board",
     })).rejects.toThrow("A decline reason is required for this confirmation");
+  });
+
+  it("accepts request_confirmation interactions with linked owner approval provenance and resolving run", async () => {
+    const companyId = randomUUID();
+    const goalId = randomUUID();
+    const issueId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const approvalId = randomUUID();
+    const decidedAt = new Date("2026-08-09T04:00:00.000Z");
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(goals).values({
+      id: goalId,
+      companyId,
+      title: "Confirm delegated request",
+      level: "task",
+      status: "active",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Jarvis",
+      role: "engineer",
+      status: "active",
+      adapterType: "test",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      goalId,
+      title: "Parent issue",
+      status: "in_progress",
+      priority: "medium",
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "issue_assigned",
+      status: "running",
+      startedAt: new Date("2026-08-09T04:01:00.000Z"),
+    });
+    await db.insert(approvals).values({
+      id: approvalId,
+      companyId,
+      type: "issue_thread_interaction_resolution",
+      requestedByAgentId: agentId,
+      status: "approved",
+      payload: { interaction: "board-only confirmation" },
+      decisionNote: "Owner approved delegated accept",
+      decidedByUserId: "owner-user",
+      decidedAt,
+    });
+    await db.insert(issueApprovals).values({
+      companyId,
+      issueId,
+      approvalId,
+      linkedByUserId: "owner-user",
+    });
+
+    const created = await interactionsSvc.create({
+      id: issueId,
+      companyId,
+    }, {
+      kind: "request_confirmation",
+      continuationPolicy: "wake_assignee",
+      payload: {
+        version: 1,
+        prompt: "Apply this plan?",
+      },
+    }, {
+      userId: "local-board",
+    });
+
+    const accepted = await interactionsSvc.acceptInteraction({
+      id: issueId,
+      companyId,
+      goalId,
+      projectId: null,
+    }, created.id, {
+      ownerAuthorization: { approvalId },
+    }, {
+      agentId,
+      runId,
+    });
+
+    expect(accepted.interaction).toMatchObject({
+      kind: "request_confirmation",
+      status: "accepted",
+      resolvedByAgentId: agentId,
+      resolvedByRunId: runId,
+      resolvedByUserId: null,
+      result: {
+        version: 1,
+        outcome: "accepted",
+        ownerAuthorization: {
+          approvalId,
+          decidedByUserId: "owner-user",
+          decidedAt: decidedAt.toISOString(),
+          decisionNote: "Owner approved delegated accept",
+        },
+      },
+    });
   });
 
   it("accepts request_checkbox_confirmation interactions with selected option ids", async () => {
