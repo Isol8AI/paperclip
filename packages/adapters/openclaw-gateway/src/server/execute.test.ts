@@ -4,6 +4,7 @@ import {
   buildAgentParams,
   classifyDailyBudgetCapDenial,
   classifyGatewayRunError,
+  classifyWakeAdmissionGateRefusal,
   CONNECT_TIMEOUT_CAP_MS,
   isWaitPending,
   nextUtcMidnight,
@@ -14,6 +15,12 @@ import {
   transientExhaustionRecovery,
   transientRetryBackoffMs,
 } from "./execute.js";
+
+function gatewayError(message: string, details?: Record<string, unknown>): Error {
+  const err = new Error(message) as Error & { gatewayDetails?: Record<string, unknown> };
+  if (details) err.gatewayDetails = details;
+  return err;
+}
 
 describe("resolveSessionKey", () => {
   it("prefixes run-scoped session keys with the configured agent", () => {
@@ -547,6 +554,42 @@ describe("classifyGatewayRunError", () => {
   it("leaves ordinary run errors non-transient", () => {
     const classified = classifyGatewayRunError("OpenClaw gateway run failed");
     expect(classified).toEqual({ timedOut: false, pairingRequired: false, isTransient: false });
+  });
+});
+
+describe("classifyWakeAdmissionGateRefusal", () => {
+  it("maps an Isol8 wake-gate refusal to provider_quota", () => {
+    const refusal = classifyWakeAdmissionGateRefusal(
+      gatewayError("You've used today's free allowance", {
+        reason: "wake_admission_gate",
+        code: "trial_daily_cap",
+      }),
+    );
+    expect(refusal).toEqual({
+      errorCode: "provider_quota",
+      errorFamily: "provider_quota",
+      retryNotBefore: null,
+    });
+  });
+
+  it("carries a retry hint through when the refusal payload has one", () => {
+    const refusal = classifyWakeAdmissionGateRefusal(
+      gatewayError("Out for today", {
+        reason: "wake_admission_gate",
+        code: "trial_daily_cap",
+        retryNotBefore: "2026-08-10T00:03:00.000Z",
+      }),
+    );
+    expect(refusal?.retryNotBefore).toBe("2026-08-10T00:03:00.000Z");
+  });
+
+  it("ignores errors without the wake_admission_gate reason", () => {
+    expect(classifyWakeAdmissionGateRefusal(gatewayError("gateway request failed"))).toBeNull();
+    expect(
+      classifyWakeAdmissionGateRefusal(gatewayError("denied", { reason: "something_else" })),
+    ).toBeNull();
+    expect(classifyWakeAdmissionGateRefusal("not an error")).toBeNull();
+    expect(classifyWakeAdmissionGateRefusal(null)).toBeNull();
   });
 });
 

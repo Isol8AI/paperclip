@@ -161,6 +161,31 @@ export function classifyGatewayRunError(message: string): {
   };
 }
 
+/**
+ * The Isol8 backend refuses an agent wake when the owner's budget is exhausted
+ * (subscription inactive, trial expired, daily cap). The refusal frame's
+ * `error.details` carries `reason: "wake_admission_gate"` — a deliberate,
+ * machine-readable contract (see isol8 `_wake_refusal_payload`), unlike the
+ * message-substring matching everywhere else. Classify it as provider_quota so
+ * the server parks the run instead of finalizing it as a plain failure. The
+ * refusal payload carries no retry hint today; pass one through if it ever does.
+ */
+export const WAKE_ADMISSION_GATE_REASON = "wake_admission_gate";
+
+export function classifyWakeAdmissionGateRefusal(err: unknown): {
+  errorCode: "provider_quota";
+  errorFamily: "provider_quota";
+  retryNotBefore: string | null;
+} | null {
+  const details = getGatewayErrorDetails(err);
+  if (nonEmpty(details?.reason) !== WAKE_ADMISSION_GATE_REASON) return null;
+  return {
+    errorCode: "provider_quota",
+    errorFamily: "provider_quota",
+    retryNotBefore: nonEmpty(details?.retryNotBefore),
+  };
+}
+
 // When the in-process retry budget is spent on a transient failure, hand the
 // run to the server's bounded retry (scheduleBoundedRetryForRun) instead of
 // finalizing it failed: errorFamily "transient_upstream" is what
@@ -1752,6 +1777,28 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
+
+      // Reason-based classification first: a wake-gate refusal is neither
+      // transient (retrying re-hits the same gate) nor a plain failure (it
+      // must park as provider_quota, not finalize the agent into error).
+      const wakeGateRefusal = classifyWakeAdmissionGateRefusal(err);
+      if (wakeGateRefusal) {
+        await ctx.onLog("stderr", `[openclaw-gateway] wake refused by admission gate: ${message}\n`);
+        return {
+          exitCode: 1,
+          signal: null,
+          timedOut: false,
+          errorMessage: message,
+          errorCode: wakeGateRefusal.errorCode,
+          errorFamily: wakeGateRefusal.errorFamily,
+          ...(wakeGateRefusal.retryNotBefore ? { retryNotBefore: wakeGateRefusal.retryNotBefore } : {}),
+          resultJson: {
+            ...(asRecord(latestResultPayload) ?? {}),
+            gatewayErrorCode: "openclaw_gateway_request_failed",
+          },
+        };
+      }
+
       const { timedOut, pairingRequired, isTransient } = classifyGatewayRunError(message);
 
       if (
