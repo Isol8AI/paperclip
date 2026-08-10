@@ -2255,7 +2255,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
 
   // Contract pair with packages/adapters/openclaw-gateway/src/server/
   // execute.test.ts ("buildTerminalFailureResult (heartbeat contract, adapter
-  // half)"): the adapter half pins that a pre-acceptance transient exhaustion
+  // half)"): the adapter half pins that a pre-dispatch transient exhaustion
   // (e.g. "gateway connect challenge timeout" during a deploy drain) returns
   // timedOut:false so finalize maps it to outcome "failed"; this half pins
   // that such a failed run — errorCode openclaw_gateway_timeout, family only

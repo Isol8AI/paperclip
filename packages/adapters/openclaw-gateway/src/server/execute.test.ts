@@ -10,7 +10,7 @@ import {
   isWaitPending,
   nextUtcMidnight,
   pickAssistantChunk,
-  POST_ACCEPTANCE_MAX_RETRIES,
+  POST_DISPATCH_MAX_RETRIES,
   resolveClaimedApiKeyPath,
   resolveSessionKey,
   TRANSIENT_MAX_RETRIES,
@@ -533,7 +533,7 @@ describe("transientRetryBackoffMs", () => {
 });
 
 describe("transientRetryPlan", () => {
-  it("gives pre-acceptance failures the widened exponential budget", () => {
+  it("gives pre-dispatch failures the widened exponential budget", () => {
     const noJitter = () => 0.5;
     expect(transientRetryPlan(false, 0, noJitter)).toEqual({ backoffMs: 2_000 });
     expect(transientRetryPlan(false, 2, noJitter)).toEqual({ backoffMs: 8_000 });
@@ -541,8 +541,8 @@ describe("transientRetryPlan", () => {
     expect(transientRetryPlan(false, TRANSIENT_MAX_RETRIES, noJitter)).toBeNull();
   });
 
-  it("keeps the legacy 2-retry linear budget once the agent request was accepted", () => {
-    expect(POST_ACCEPTANCE_MAX_RETRIES).toBe(2);
+  it("keeps the legacy 2-retry linear budget once the agent request was dispatched", () => {
+    expect(POST_DISPATCH_MAX_RETRIES).toBe(2);
     expect(transientRetryPlan(true, 0)).toEqual({ backoffMs: 2_000 });
     expect(transientRetryPlan(true, 1)).toEqual({ backoffMs: 4_000 });
     expect(transientRetryPlan(true, 2)).toBeNull();
@@ -651,7 +651,7 @@ describe("buildTerminalFailureResult (heartbeat contract, adapter half)", () => 
   it("returns a FAILED-mapping result for challenge-timeout exhaustion: timedOut false, timeout errorCode kept, transient_upstream attached", () => {
     const result = buildTerminalFailureResult({
       message: "gateway connect challenge timeout",
-      agentAccepted: false,
+      agentDispatched: false,
       latestResultPayload: null,
       now,
     });
@@ -663,10 +663,10 @@ describe("buildTerminalFailureResult (heartbeat contract, adapter half)", () => 
     expect(result.retryNotBefore).toBe("2026-08-09T12:02:00.000Z");
   });
 
-  it("keeps timedOut true and attaches no recovery for a post-acceptance timeout", () => {
+  it("keeps timedOut true and attaches no recovery for a post-dispatch timeout", () => {
     const result = buildTerminalFailureResult({
       message: "gateway request timeout (agent.wait)",
-      agentAccepted: true,
+      agentDispatched: true,
       latestResultPayload: null,
       now,
     });
@@ -676,10 +676,29 @@ describe("buildTerminalFailureResult (heartbeat contract, adapter half)", () => 
     expect(result.retryNotBefore).toBeUndefined();
   });
 
+  it("treats a sent-but-unacknowledged agent request as possibly accepted: legacy retry cap, no transient_upstream", () => {
+    // The agent request frame reached the socket but the ack never came back
+    // (connection dropped / request timeout). The container may have received
+    // it and started the run, so no re-dispatch contract may attach.
+    const result = buildTerminalFailureResult({
+      message: "gateway request timeout (agent)",
+      agentDispatched: true,
+      latestResultPayload: null,
+      now,
+    });
+    expect(result.errorFamily).toBeUndefined();
+    expect(result.retryNotBefore).toBeUndefined();
+    expect(result.timedOut).toBe(true);
+    expect(result.errorCode).toBe("openclaw_gateway_timeout");
+    // In-process retries stay at the legacy cap on this path.
+    expect(transientRetryPlan(true, 0)).toEqual({ backoffMs: 2_000 });
+    expect(transientRetryPlan(true, POST_DISPATCH_MAX_RETRIES)).toBeNull();
+  });
+
   it("keeps the pairing-required guidance and terminal semantics unchanged", () => {
     const result = buildTerminalFailureResult({
       message: "gateway connect failed: pairing required",
-      agentAccepted: false,
+      agentDispatched: false,
       latestResultPayload: null,
       now,
     });
@@ -693,7 +712,7 @@ describe("buildTerminalFailureResult (heartbeat contract, adapter half)", () => 
   it("leaves non-transient failures as plain request failures with the last payload attached", () => {
     const result = buildTerminalFailureResult({
       message: "OpenClaw gateway run failed",
-      agentAccepted: false,
+      agentDispatched: false,
       latestResultPayload: { status: "error" },
       now,
     });
@@ -705,7 +724,7 @@ describe("buildTerminalFailureResult (heartbeat contract, adapter half)", () => 
 });
 
 describe("transientExhaustionRecovery", () => {
-  it("parks a PRE-acceptance exhaustion as transient_upstream with retryNotBefore 120s out, ISO-formatted", () => {
+  it("parks a PRE-dispatch exhaustion as transient_upstream with retryNotBefore 120s out, ISO-formatted", () => {
     const now = new Date("2026-08-09T12:00:00.000Z");
     expect(transientExhaustionRecovery(false, now)).toEqual({
       errorFamily: "transient_upstream",
@@ -713,7 +732,7 @@ describe("transientExhaustionRecovery", () => {
     });
   });
 
-  it("never labels a post-acceptance failure: a server re-dispatch could duplicate an accepted run's side effects", () => {
+  it("never labels a post-dispatch failure: a server re-dispatch could duplicate a possibly-started run's side effects", () => {
     expect(transientExhaustionRecovery(true)).toBeNull();
     expect(transientExhaustionRecovery(true, new Date("2026-08-09T12:00:00.000Z"))).toBeNull();
   });
