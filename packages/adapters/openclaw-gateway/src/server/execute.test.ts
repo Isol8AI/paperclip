@@ -3,6 +3,7 @@ import {
   awaitRunResilient,
   buildAgentParams,
   classifyDailyBudgetCapDenial,
+  classifyGatewayRunError,
   CONNECT_TIMEOUT_CAP_MS,
   isWaitPending,
   nextUtcMidnight,
@@ -10,6 +11,7 @@ import {
   resolveClaimedApiKeyPath,
   resolveSessionKey,
   TRANSIENT_MAX_RETRIES,
+  transientExhaustionRecovery,
   transientRetryBackoffMs,
 } from "./execute.js";
 
@@ -514,5 +516,46 @@ describe("transientRetryBackoffMs", () => {
     }
     const worstCaseWindowMs = attempts * worstPerAttemptMs + worstBackoffTotalMs;
     expect(worstCaseWindowMs).toBeLessThanOrEqual(fleetRunTimeoutMs / 2);
+  });
+});
+
+describe("classifyGatewayRunError", () => {
+  it("classifies connection-level failures as transient", () => {
+    expect(classifyGatewayRunError("connect ECONNREFUSED 10.0.1.12:443").isTransient).toBe(true);
+    expect(classifyGatewayRunError("read ECONNRESET").isTransient).toBe(true);
+    expect(classifyGatewayRunError("socket hang up").isTransient).toBe(true);
+  });
+
+  it("classifies the deploy-drain connect challenge timeout as transient", () => {
+    const classified = classifyGatewayRunError("gateway connect challenge timeout");
+    expect(classified.isTransient).toBe(true);
+    expect(classified.timedOut).toBe(true);
+  });
+
+  it("does not classify an agent.wait timeout as transient", () => {
+    const classified = classifyGatewayRunError("gateway request timeout: agent.wait");
+    expect(classified.isTransient).toBe(false);
+    expect(classified.timedOut).toBe(true);
+  });
+
+  it("does not classify pairing-required as transient", () => {
+    const classified = classifyGatewayRunError("gateway connect failed: pairing required");
+    expect(classified.pairingRequired).toBe(true);
+    expect(classified.isTransient).toBe(false);
+  });
+
+  it("leaves ordinary run errors non-transient", () => {
+    const classified = classifyGatewayRunError("OpenClaw gateway run failed");
+    expect(classified).toEqual({ timedOut: false, pairingRequired: false, isTransient: false });
+  });
+});
+
+describe("transientExhaustionRecovery", () => {
+  it("parks the run as transient_upstream with retryNotBefore 120s out, ISO-formatted", () => {
+    const now = new Date("2026-08-09T12:00:00.000Z");
+    expect(transientExhaustionRecovery(now)).toEqual({
+      errorFamily: "transient_upstream",
+      retryNotBefore: "2026-08-09T12:02:00.000Z",
+    });
   });
 });

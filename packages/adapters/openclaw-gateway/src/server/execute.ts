@@ -135,6 +135,49 @@ export function transientRetryBackoffMs(
   return Math.round(base * (1 + (2 * sample - 1) * TRANSIENT_BACKOFF_JITTER_RATIO));
 }
 
+/**
+ * Classify a thrown gateway run error by its message. Transient means "the
+ * gateway itself was unreachable or dropped us" — worth retrying in-process.
+ * An `agent.wait` timeout is excluded: the run was accepted and is bounded by
+ * awaitRunResilient, so its timeout is a run outcome, not a connection blip.
+ */
+export function classifyGatewayRunError(message: string): {
+  timedOut: boolean;
+  pairingRequired: boolean;
+  isTransient: boolean;
+} {
+  const lower = message.toLowerCase();
+  const timedOut = lower.includes("timeout");
+  const pairingRequired = lower.includes("pairing required");
+  return {
+    timedOut,
+    pairingRequired,
+    isTransient:
+      !pairingRequired &&
+      (lower.includes("econnrefused") ||
+        lower.includes("econnreset") ||
+        lower.includes("socket hang up") ||
+        (timedOut && !lower.includes("agent.wait"))),
+  };
+}
+
+// When the in-process retry budget is spent on a transient failure, hand the
+// run to the server's bounded retry (scheduleBoundedRetryForRun) instead of
+// finalizing it failed: errorFamily "transient_upstream" is what
+// readHeartbeatRunErrorFamily engages on, and retryNotBefore parks the next
+// attempt past the tail of a deploy drain.
+const TRANSIENT_EXHAUSTION_RETRY_NOT_BEFORE_MS = 120_000;
+
+export function transientExhaustionRecovery(now: Date = new Date()): {
+  errorFamily: "transient_upstream";
+  retryNotBefore: string;
+} {
+  return {
+    errorFamily: "transient_upstream",
+    retryNotBefore: new Date(now.getTime() + TRANSIENT_EXHAUSTION_RETRY_NOT_BEFORE_MS).toISOString(),
+  };
+}
+
 const SENSITIVE_LOG_KEY_PATTERN =
   /(^|[_-])(auth|authorization|token|secret|password|api[_-]?key|private[_-]?key)([_-]|$)|^x-openclaw-(auth|token)$/i;
 
@@ -1709,9 +1752,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      const lower = message.toLowerCase();
-      const timedOut = lower.includes("timeout");
-      const pairingRequired = lower.includes("pairing required");
+      const { timedOut, pairingRequired, isTransient } = classifyGatewayRunError(message);
 
       if (
         pairingRequired &&
@@ -1750,13 +1791,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       }
 
       // Retry transient errors (connection refused, reset, socket hang up)
-      const isTransient =
-        !pairingRequired &&
-        (lower.includes("econnrefused") ||
-          lower.includes("econnreset") ||
-          lower.includes("socket hang up") ||
-          (timedOut && !lower.includes("agent.wait")));
-
       if (isTransient && retryCount < TRANSIENT_MAX_RETRIES) {
         retryCount++;
         const backoffMs = transientRetryBackoffMs(retryCount);
@@ -1784,6 +1818,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           : pairingRequired
             ? "openclaw_gateway_pairing_required"
             : "openclaw_gateway_request_failed",
+        // A transient failure that exhausted the in-process budget stays
+        // recoverable server-side; permanent config errors (pairing, bad URL)
+        // never carry a recovery contract.
+        ...(isTransient ? transientExhaustionRecovery() : {}),
         resultJson: asRecord(latestResultPayload),
       };
     } finally {
