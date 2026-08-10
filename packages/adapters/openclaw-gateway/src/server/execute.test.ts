@@ -3,11 +3,14 @@ import {
   awaitRunResilient,
   buildAgentParams,
   classifyDailyBudgetCapDenial,
+  CONNECT_TIMEOUT_CAP_MS,
   isWaitPending,
   nextUtcMidnight,
   pickAssistantChunk,
   resolveClaimedApiKeyPath,
   resolveSessionKey,
+  TRANSIENT_MAX_RETRIES,
+  transientRetryBackoffMs,
 } from "./execute.js";
 
 describe("resolveSessionKey", () => {
@@ -474,5 +477,42 @@ describe("classifyDailyBudgetCapDenial", () => {
     expect(classifyDailyBudgetCapDenial("", now)).toBeNull();
     expect(classifyDailyBudgetCapDenial(null, now)).toBeNull();
     expect(classifyDailyBudgetCapDenial(undefined, now)).toBeNull();
+  });
+});
+
+describe("transientRetryBackoffMs", () => {
+  it("doubles per retry and caps at 30s (jitter neutral at random()=0.5)", () => {
+    const noJitter = () => 0.5;
+    expect(transientRetryBackoffMs(1, noJitter)).toBe(2_000);
+    expect(transientRetryBackoffMs(2, noJitter)).toBe(4_000);
+    expect(transientRetryBackoffMs(3, noJitter)).toBe(8_000);
+    expect(transientRetryBackoffMs(4, noJitter)).toBe(16_000);
+    expect(transientRetryBackoffMs(5, noJitter)).toBe(30_000);
+    expect(transientRetryBackoffMs(6, noJitter)).toBe(30_000);
+  });
+
+  it("bounds jitter to ±20% of the base delay", () => {
+    expect(transientRetryBackoffMs(3, () => 0)).toBe(6_400);
+    expect(transientRetryBackoffMs(3, () => 1)).toBe(9_600);
+    for (let retry = 1; retry <= TRANSIENT_MAX_RETRIES; retry += 1) {
+      const base = Math.min(2 ** retry * 1000, 30_000);
+      for (const sample of [0, 0.25, 0.5, 0.75, 1]) {
+        const delay = transientRetryBackoffMs(retry, () => sample);
+        expect(delay).toBeGreaterThanOrEqual(base * 0.8);
+        expect(delay).toBeLessThanOrEqual(base * 1.2);
+      }
+    }
+  });
+
+  it("keeps the worst-case retry window well inside the 600s fleet run timeout", () => {
+    const fleetRunTimeoutMs = 600_000;
+    const attempts = TRANSIENT_MAX_RETRIES + 1;
+    const worstPerAttemptMs = 2 * CONNECT_TIMEOUT_CAP_MS;
+    let worstBackoffTotalMs = 0;
+    for (let retry = 1; retry <= TRANSIENT_MAX_RETRIES; retry += 1) {
+      worstBackoffTotalMs += transientRetryBackoffMs(retry, () => 1);
+    }
+    const worstCaseWindowMs = attempts * worstPerAttemptMs + worstBackoffTotalMs;
+    expect(worstCaseWindowMs).toBeLessThanOrEqual(fleetRunTimeoutMs / 2);
   });
 });

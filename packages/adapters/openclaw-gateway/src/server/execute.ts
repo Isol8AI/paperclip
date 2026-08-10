@@ -110,6 +110,31 @@ const WAIT_RECONNECT_BACKOFF_MS = 2_000;
 const WAIT_RECONNECT_BACKOFF_MAX_MS = 30_000;
 const MAX_CONSECUTIVE_WAIT_RECONNECT_FAILURES = 8; // consecutive wait+reconnect failures (with growing backoff) before giving up — enough to ride out a gateway restart, but bounded so a dead gateway does not hang forever.
 
+// A single connect/handshake attempt never waits longer than this, whatever
+// the configured run timeout says.
+export const CONNECT_TIMEOUT_CAP_MS = 15_000;
+
+// --- Transient-failure retry budget ------------------------------------------
+// Isol8 backend deploys and container replacements drain the gateway for
+// multiple minutes; every wake in that window dies with "gateway connect
+// challenge timeout" (or econnrefused/econnreset). The budget below must ride
+// out a normal deploy drain while the worst-case window (all attempts time out
+// at CONNECT_TIMEOUT_CAP_MS twice — connect + agent request — plus max-jitter
+// backoffs) stays well inside the 600s fleet run timeout; a test pins that
+// bound.
+export const TRANSIENT_MAX_RETRIES = 5;
+const TRANSIENT_BACKOFF_CAP_MS = 30_000;
+const TRANSIENT_BACKOFF_JITTER_RATIO = 0.2;
+
+export function transientRetryBackoffMs(
+  retryCount: number,
+  random: () => number = Math.random,
+): number {
+  const base = Math.min(2 ** retryCount * 1000, TRANSIENT_BACKOFF_CAP_MS);
+  const sample = Math.min(1, Math.max(0, random()));
+  return Math.round(base * (1 + (2 * sample - 1) * TRANSIENT_BACKOFF_JITTER_RATIO));
+}
+
 const SENSITIVE_LOG_KEY_PATTERN =
   /(^|[_-])(auth|authorization|token|secret|password|api[_-]?key|private[_-]?key)([_-]|$)|^x-openclaw-(auth|token)$/i;
 
@@ -1270,7 +1295,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   const timeoutSec = Math.max(0, Math.floor(asNumber(ctx.config.timeoutSec, 120)));
   const timeoutMs = timeoutSec > 0 ? timeoutSec * 1000 : 0;
-  const connectTimeoutMs = timeoutMs > 0 ? Math.min(timeoutMs, 15_000) : 10_000;
+  const connectTimeoutMs = timeoutMs > 0 ? Math.min(timeoutMs, CONNECT_TIMEOUT_CAP_MS) : 10_000;
   const waitTimeoutMs = parseOptionalPositiveInteger(ctx.config.waitTimeoutMs) ?? (timeoutMs > 0 ? timeoutMs : 30_000);
   // Detached-run waiting: `agent.wait` is polled in `waitSliceMs` slices and the
   // total run is bounded by `maxRunMs`, not by a single wall-clock wait. Defaults
@@ -1378,7 +1403,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   let autoPairAttempted = false;
   let latestResultPayload: unknown = null;
   let retryCount = 0;
-  const MAX_RETRIES = 2;
 
   while (true) {
     const trackedRunIds = new Set<string>([ctx.runId]);
@@ -1733,12 +1757,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           lower.includes("socket hang up") ||
           (timedOut && !lower.includes("agent.wait")));
 
-      if (isTransient && retryCount < MAX_RETRIES) {
+      if (isTransient && retryCount < TRANSIENT_MAX_RETRIES) {
         retryCount++;
-        const backoffMs = retryCount * 2000;
+        const backoffMs = transientRetryBackoffMs(retryCount);
         await ctx.onLog(
           "stdout",
-          `[openclaw-gateway] transient error, retry ${retryCount}/${MAX_RETRIES} after ${backoffMs}ms: ${message}\n`,
+          `[openclaw-gateway] transient error, retry ${retryCount}/${TRANSIENT_MAX_RETRIES} after ${backoffMs}ms: ${message}\n`,
         );
         await new Promise((r) => setTimeout(r, backoffMs));
         continue;
