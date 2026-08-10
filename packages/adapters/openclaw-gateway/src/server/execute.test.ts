@@ -9,11 +9,13 @@ import {
   isWaitPending,
   nextUtcMidnight,
   pickAssistantChunk,
+  POST_ACCEPTANCE_MAX_RETRIES,
   resolveClaimedApiKeyPath,
   resolveSessionKey,
   TRANSIENT_MAX_RETRIES,
   transientExhaustionRecovery,
   transientRetryBackoffMs,
+  transientRetryPlan,
 } from "./execute.js";
 
 function gatewayError(message: string, details?: Record<string, unknown>): Error {
@@ -514,15 +516,35 @@ describe("transientRetryBackoffMs", () => {
   });
 
   it("keeps the worst-case retry window well inside the 600s fleet run timeout", () => {
+    // One pre-acceptance attempt can burn FOUR sequential connectTimeoutMs
+    // waits: ws open, connect challenge, connect request, agent request.
     const fleetRunTimeoutMs = 600_000;
     const attempts = TRANSIENT_MAX_RETRIES + 1;
-    const worstPerAttemptMs = 2 * CONNECT_TIMEOUT_CAP_MS;
+    const worstPerAttemptMs = 4 * CONNECT_TIMEOUT_CAP_MS;
     let worstBackoffTotalMs = 0;
     for (let retry = 1; retry <= TRANSIENT_MAX_RETRIES; retry += 1) {
       worstBackoffTotalMs += transientRetryBackoffMs(retry, () => 1);
     }
     const worstCaseWindowMs = attempts * worstPerAttemptMs + worstBackoffTotalMs;
-    expect(worstCaseWindowMs).toBeLessThanOrEqual(fleetRunTimeoutMs / 2);
+    expect(worstCaseWindowMs).toBeLessThanOrEqual(370_000);
+    expect(fleetRunTimeoutMs - worstCaseWindowMs).toBeGreaterThanOrEqual(230_000);
+  });
+});
+
+describe("transientRetryPlan", () => {
+  it("gives pre-acceptance failures the widened exponential budget", () => {
+    const noJitter = () => 0.5;
+    expect(transientRetryPlan(false, 0, noJitter)).toEqual({ backoffMs: 2_000 });
+    expect(transientRetryPlan(false, 2, noJitter)).toEqual({ backoffMs: 8_000 });
+    expect(transientRetryPlan(false, TRANSIENT_MAX_RETRIES - 1, noJitter)).not.toBeNull();
+    expect(transientRetryPlan(false, TRANSIENT_MAX_RETRIES, noJitter)).toBeNull();
+  });
+
+  it("keeps the legacy 2-retry linear budget once the agent request was accepted", () => {
+    expect(POST_ACCEPTANCE_MAX_RETRIES).toBe(2);
+    expect(transientRetryPlan(true, 0)).toEqual({ backoffMs: 2_000 });
+    expect(transientRetryPlan(true, 1)).toEqual({ backoffMs: 4_000 });
+    expect(transientRetryPlan(true, 2)).toBeNull();
   });
 });
 
@@ -558,11 +580,13 @@ describe("classifyGatewayRunError", () => {
 });
 
 describe("classifyWakeAdmissionGateRefusal", () => {
-  it("maps an Isol8 wake-gate refusal to provider_quota", () => {
+  const now = new Date("2026-07-24T18:31:07.000Z");
+
+  it("maps an Isol8 wake-gate refusal to provider_quota with no park when the code has no known reset", () => {
     const refusal = classifyWakeAdmissionGateRefusal(
-      gatewayError("You've used today's free allowance", {
+      gatewayError("Your subscription is inactive", {
         reason: "wake_admission_gate",
-        code: "trial_daily_cap",
+        code: "subscription_inactive",
       }),
     );
     expect(refusal).toEqual({
@@ -572,13 +596,34 @@ describe("classifyWakeAdmissionGateRefusal", () => {
     });
   });
 
-  it("carries a retry hint through when the refusal payload has one", () => {
+  it("parks a trial_daily_cap refusal at the next UTC midnight like the in-band cap denial", () => {
+    const refusal = classifyWakeAdmissionGateRefusal(
+      gatewayError("You've used today's free allowance", {
+        reason: "wake_admission_gate",
+        code: "trial_daily_cap",
+      }),
+      now,
+      () => 0,
+    );
+    expect(refusal).toEqual({
+      errorCode: "provider_quota",
+      errorFamily: "provider_quota",
+      retryNotBefore: "2026-07-25T00:01:00.000Z",
+    });
+    expect(refusal?.retryNotBefore).toBe(
+      classifyDailyBudgetCapDenial("daily free limit reached", now, () => 0)?.retryNotBefore,
+    );
+  });
+
+  it("carries an explicit retry hint through, ahead of the code-derived park", () => {
     const refusal = classifyWakeAdmissionGateRefusal(
       gatewayError("Out for today", {
         reason: "wake_admission_gate",
         code: "trial_daily_cap",
         retryNotBefore: "2026-08-10T00:03:00.000Z",
       }),
+      now,
+      () => 0,
     );
     expect(refusal?.retryNotBefore).toBe("2026-08-10T00:03:00.000Z");
   });
@@ -594,11 +639,16 @@ describe("classifyWakeAdmissionGateRefusal", () => {
 });
 
 describe("transientExhaustionRecovery", () => {
-  it("parks the run as transient_upstream with retryNotBefore 120s out, ISO-formatted", () => {
+  it("parks a PRE-acceptance exhaustion as transient_upstream with retryNotBefore 120s out, ISO-formatted", () => {
     const now = new Date("2026-08-09T12:00:00.000Z");
-    expect(transientExhaustionRecovery(now)).toEqual({
+    expect(transientExhaustionRecovery(false, now)).toEqual({
       errorFamily: "transient_upstream",
       retryNotBefore: "2026-08-09T12:02:00.000Z",
     });
+  });
+
+  it("never labels a post-acceptance failure: a server re-dispatch could duplicate an accepted run's side effects", () => {
+    expect(transientExhaustionRecovery(true)).toBeNull();
+    expect(transientExhaustionRecovery(true, new Date("2026-08-09T12:00:00.000Z"))).toBeNull();
   });
 });

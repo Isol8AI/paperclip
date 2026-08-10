@@ -117,12 +117,20 @@ export const CONNECT_TIMEOUT_CAP_MS = 15_000;
 // --- Transient-failure retry budget ------------------------------------------
 // Isol8 backend deploys and container replacements drain the gateway for
 // multiple minutes; every wake in that window dies with "gateway connect
-// challenge timeout" (or econnrefused/econnreset). The budget below must ride
-// out a normal deploy drain while the worst-case window (all attempts time out
-// at CONNECT_TIMEOUT_CAP_MS twice — connect + agent request — plus max-jitter
-// backoffs) stays well inside the 600s fleet run timeout; a test pins that
-// bound.
-export const TRANSIENT_MAX_RETRIES = 5;
+// challenge timeout" (or econnrefused/econnreset). The widened budget below
+// applies only BEFORE the agent request is accepted, where a resend is
+// idempotent. One failed pre-acceptance attempt can burn up to FOUR sequential
+// connectTimeoutMs waits (ws open, connect challenge, connect request, agent
+// request), so the worst-case window is (retries+1) * 4*CONNECT_TIMEOUT_CAP_MS
+// plus max-jitter backoffs — 336s at this budget, pinned by a test to stay
+// well inside the 600s fleet run timeout.
+export const TRANSIENT_MAX_RETRIES = 4;
+// Once the gateway ACCEPTED the agent request, a re-send is no longer known to
+// be idempotent — the container may still be executing the run, and another
+// dispatch can duplicate its side effects. Post-acceptance failures keep the
+// pre-self-healing budget: 2 retries, linear 2s/4s backoff, no recovery
+// contract on exhaustion.
+export const POST_ACCEPTANCE_MAX_RETRIES = 2;
 const TRANSIENT_BACKOFF_CAP_MS = 30_000;
 const TRANSIENT_BACKOFF_JITTER_RATIO = 0.2;
 
@@ -133,6 +141,24 @@ export function transientRetryBackoffMs(
   const base = Math.min(2 ** retryCount * 1000, TRANSIENT_BACKOFF_CAP_MS);
   const sample = Math.min(1, Math.max(0, random()));
   return Math.round(base * (1 + (2 * sample - 1) * TRANSIENT_BACKOFF_JITTER_RATIO));
+}
+
+/**
+ * Decide whether (and after what delay) a transient failure is retried
+ * in-process. `retryCount` is the number of retries already spent. Returns
+ * null when the applicable budget is exhausted.
+ */
+export function transientRetryPlan(
+  agentAccepted: boolean,
+  retryCount: number,
+  random: () => number = Math.random,
+): { backoffMs: number } | null {
+  if (agentAccepted) {
+    return retryCount < POST_ACCEPTANCE_MAX_RETRIES ? { backoffMs: (retryCount + 1) * 2000 } : null;
+  }
+  return retryCount < TRANSIENT_MAX_RETRIES
+    ? { backoffMs: transientRetryBackoffMs(retryCount + 1, random) }
+    : null;
 }
 
 /**
@@ -167,36 +193,56 @@ export function classifyGatewayRunError(message: string): {
  * `error.details` carries `reason: "wake_admission_gate"` — a deliberate,
  * machine-readable contract (see isol8 `_wake_refusal_payload`), unlike the
  * message-substring matching everywhere else. Classify it as provider_quota so
- * the server parks the run instead of finalizing it as a plain failure. The
- * refusal payload carries no retry hint today; pass one through if it ever does.
+ * the server parks the run instead of finalizing it as a plain failure.
+ *
+ * retryNotBefore: an explicit hint in the refusal payload wins; otherwise a
+ * `trial_daily_cap` refusal parks at the next UTC midnight (same jittered
+ * instant as classifyDailyBudgetCapDenial — it is the identical condition,
+ * refused at the door instead of denied in-band). The server's own 2m→2h
+ * retry ladder would exhaust long before the cap resets. Codes with no known
+ * reset instant carry no park.
  */
 export const WAKE_ADMISSION_GATE_REASON = "wake_admission_gate";
+const WAKE_ADMISSION_DAILY_CAP_CODE = "trial_daily_cap";
 
-export function classifyWakeAdmissionGateRefusal(err: unknown): {
+export function classifyWakeAdmissionGateRefusal(
+  err: unknown,
+  now: Date = new Date(),
+  random: () => number = Math.random,
+): {
   errorCode: "provider_quota";
   errorFamily: "provider_quota";
   retryNotBefore: string | null;
 } | null {
   const details = getGatewayErrorDetails(err);
   if (nonEmpty(details?.reason) !== WAKE_ADMISSION_GATE_REASON) return null;
+  const hinted = nonEmpty(details?.retryNotBefore);
   return {
     errorCode: "provider_quota",
     errorFamily: "provider_quota",
-    retryNotBefore: nonEmpty(details?.retryNotBefore),
+    retryNotBefore:
+      hinted ??
+      (nonEmpty(details?.code) === WAKE_ADMISSION_DAILY_CAP_CODE
+        ? dailyCapRetryNotBefore(now, random)
+        : null),
   };
 }
 
-// When the in-process retry budget is spent on a transient failure, hand the
-// run to the server's bounded retry (scheduleBoundedRetryForRun) instead of
-// finalizing it failed: errorFamily "transient_upstream" is what
-// readHeartbeatRunErrorFamily engages on, and retryNotBefore parks the next
-// attempt past the tail of a deploy drain.
+// When the in-process retry budget is spent on a PRE-acceptance transient
+// failure, hand the run to the server's bounded retry
+// (scheduleBoundedRetryForRun) instead of finalizing it failed: errorFamily
+// "transient_upstream" is what readHeartbeatRunErrorFamily engages on, and
+// retryNotBefore parks the next attempt past the tail of a deploy drain.
+// A POST-acceptance failure never gets the label — the container may still be
+// executing the accepted run, and a server re-dispatch could duplicate its
+// side effects.
 const TRANSIENT_EXHAUSTION_RETRY_NOT_BEFORE_MS = 120_000;
 
-export function transientExhaustionRecovery(now: Date = new Date()): {
-  errorFamily: "transient_upstream";
-  retryNotBefore: string;
-} {
+export function transientExhaustionRecovery(
+  agentAccepted: boolean,
+  now: Date = new Date(),
+): { errorFamily: "transient_upstream"; retryNotBefore: string } | null {
+  if (agentAccepted) return null;
   return {
     errorFamily: "transient_upstream",
     retryNotBefore: new Date(now.getTime() + TRANSIENT_EXHAUSTION_RETRY_NOT_BEFORE_MS).toISOString(),
@@ -1198,19 +1244,23 @@ export function nextUtcMidnight(now: Date): Date {
   return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1));
 }
 
+function dailyCapRetryNotBefore(now: Date, random: () => number): string {
+  const sample = Math.min(1, Math.max(0, random()));
+  const jitterMs = DAILY_BUDGET_CAP_RETRY_JITTER_MIN_MS +
+    Math.round(sample * DAILY_BUDGET_CAP_RETRY_JITTER_RANGE_MS);
+  return new Date(nextUtcMidnight(now).getTime() + jitterMs).toISOString();
+}
+
 export function classifyDailyBudgetCapDenial(
   errorMessage: string | null | undefined,
   now: Date = new Date(),
   random: () => number = Math.random,
 ): { errorCode: "provider_quota"; errorFamily: "provider_quota"; retryNotBefore: string } | null {
   if (!errorMessage?.toLowerCase().includes(DAILY_BUDGET_CAP_ERROR_SNIPPET)) return null;
-  const sample = Math.min(1, Math.max(0, random()));
-  const jitterMs = DAILY_BUDGET_CAP_RETRY_JITTER_MIN_MS +
-    Math.round(sample * DAILY_BUDGET_CAP_RETRY_JITTER_RANGE_MS);
   return {
     errorCode: "provider_quota",
     errorFamily: "provider_quota",
-    retryNotBefore: new Date(nextUtcMidnight(now).getTime() + jitterMs).toISOString(),
+    retryNotBefore: dailyCapRetryNotBefore(now, random),
   };
 }
 
@@ -1471,6 +1521,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   let autoPairAttempted = false;
   let latestResultPayload: unknown = null;
   let retryCount = 0;
+  // Flips once the gateway accepted the agent request (response resolved OR a
+  // tracked-run event arrived — the run can start streaming before the ack).
+  // Past that point a re-send may duplicate an executing run's side effects,
+  // so the widened retry/recovery semantics apply only while this is false.
+  let agentAccepted = false;
 
   while (true) {
     const trackedRunIds = new Set<string>([ctx.runId]);
@@ -1499,6 +1554,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       // Any event for the tracked run is liveness evidence for awaitRunResilient's
       // stall bound (reliable across reconnects — an active run keeps emitting).
       lastEventAt = Date.now();
+      agentAccepted = true;
 
       const stream = nonEmpty(payload.stream) ?? "unknown";
       const data = asRecord(payload.data) ?? {};
@@ -1625,6 +1681,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         timeoutMs: connectTimeoutMs,
       });
 
+      agentAccepted = true;
       latestResultPayload = acceptedPayload;
 
       const acceptedStatus = nonEmpty(acceptedPayload?.status)?.toLowerCase() ?? "";
@@ -1838,14 +1895,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       }
 
       // Retry transient errors (connection refused, reset, socket hang up)
-      if (isTransient && retryCount < TRANSIENT_MAX_RETRIES) {
+      const retryPlan = isTransient ? transientRetryPlan(agentAccepted, retryCount) : null;
+      if (retryPlan) {
         retryCount++;
-        const backoffMs = transientRetryBackoffMs(retryCount);
+        const retryBudget = agentAccepted ? POST_ACCEPTANCE_MAX_RETRIES : TRANSIENT_MAX_RETRIES;
         await ctx.onLog(
           "stdout",
-          `[openclaw-gateway] transient error, retry ${retryCount}/${TRANSIENT_MAX_RETRIES} after ${backoffMs}ms: ${message}\n`,
+          `[openclaw-gateway] transient error, retry ${retryCount}/${retryBudget} after ${retryPlan.backoffMs}ms: ${message}\n`,
         );
-        await new Promise((r) => setTimeout(r, backoffMs));
+        await new Promise((r) => setTimeout(r, retryPlan.backoffMs));
         continue;
       }
 
@@ -1865,10 +1923,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           : pairingRequired
             ? "openclaw_gateway_pairing_required"
             : "openclaw_gateway_request_failed",
-        // A transient failure that exhausted the in-process budget stays
-        // recoverable server-side; permanent config errors (pairing, bad URL)
-        // never carry a recovery contract.
-        ...(isTransient ? transientExhaustionRecovery() : {}),
+        // A PRE-acceptance transient failure that exhausted the in-process
+        // budget stays recoverable server-side; post-acceptance failures and
+        // permanent config errors (pairing, bad URL) never carry a recovery
+        // contract.
+        ...(isTransient ? (transientExhaustionRecovery(agentAccepted) ?? {}) : {}),
         resultJson: asRecord(latestResultPayload),
       };
     } finally {
