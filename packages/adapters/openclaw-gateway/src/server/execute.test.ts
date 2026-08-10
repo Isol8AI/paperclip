@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   awaitRunResilient,
   buildAgentParams,
+  buildTerminalFailureResult,
   classifyDailyBudgetCapDenial,
   classifyGatewayRunError,
   classifyWakeAdmissionGateRefusal,
@@ -635,6 +636,71 @@ describe("classifyWakeAdmissionGateRefusal", () => {
     ).toBeNull();
     expect(classifyWakeAdmissionGateRefusal("not an error")).toBeNull();
     expect(classifyWakeAdmissionGateRefusal(null)).toBeNull();
+  });
+});
+
+// Contract pair with server/src/__tests__/heartbeat-retry-scheduling.test.ts
+// ("openclaw gateway transient exhaustion schedules the bounded retry"):
+// this half pins that the adapter's exhaustion result maps to heartbeat
+// outcome "failed" (timedOut false, exitCode 1, errorMessage set) — the ONLY
+// outcome scheduleBoundedRetryForRun engages on; the server half pins that a
+// failed run persisted with this metadata actually schedules the retry.
+describe("buildTerminalFailureResult (heartbeat contract, adapter half)", () => {
+  const now = new Date("2026-08-09T12:00:00.000Z");
+
+  it("returns a FAILED-mapping result for challenge-timeout exhaustion: timedOut false, timeout errorCode kept, transient_upstream attached", () => {
+    const result = buildTerminalFailureResult({
+      message: "gateway connect challenge timeout",
+      agentAccepted: false,
+      latestResultPayload: null,
+      now,
+    });
+    expect(result.timedOut).toBe(false);
+    expect(result.exitCode).toBe(1);
+    expect(result.errorMessage).toBe("gateway connect challenge timeout");
+    expect(result.errorCode).toBe("openclaw_gateway_timeout");
+    expect(result.errorFamily).toBe("transient_upstream");
+    expect(result.retryNotBefore).toBe("2026-08-09T12:02:00.000Z");
+  });
+
+  it("keeps timedOut true and attaches no recovery for a post-acceptance timeout", () => {
+    const result = buildTerminalFailureResult({
+      message: "gateway request timeout (agent.wait)",
+      agentAccepted: true,
+      latestResultPayload: null,
+      now,
+    });
+    expect(result.timedOut).toBe(true);
+    expect(result.errorCode).toBe("openclaw_gateway_timeout");
+    expect(result.errorFamily).toBeUndefined();
+    expect(result.retryNotBefore).toBeUndefined();
+  });
+
+  it("keeps the pairing-required guidance and terminal semantics unchanged", () => {
+    const result = buildTerminalFailureResult({
+      message: "gateway connect failed: pairing required",
+      agentAccepted: false,
+      latestResultPayload: null,
+      now,
+    });
+    expect(result.timedOut).toBe(false);
+    expect(result.errorCode).toBe("openclaw_gateway_pairing_required");
+    expect(result.errorMessage).toContain("pairing required");
+    expect(result.errorMessage).toContain("openclaw devices approve");
+    expect(result.errorFamily).toBeUndefined();
+  });
+
+  it("leaves non-transient failures as plain request failures with the last payload attached", () => {
+    const result = buildTerminalFailureResult({
+      message: "OpenClaw gateway run failed",
+      agentAccepted: false,
+      latestResultPayload: { status: "error" },
+      now,
+    });
+    expect(result.timedOut).toBe(false);
+    expect(result.errorCode).toBe("openclaw_gateway_request_failed");
+    expect(result.errorFamily).toBeUndefined();
+    expect(result.resultJson).toEqual({ status: "error" });
   });
 });
 

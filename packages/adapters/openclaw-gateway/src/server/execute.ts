@@ -249,6 +249,47 @@ export function transientExhaustionRecovery(
   };
 }
 
+/**
+ * Build the terminal failure result once the in-process budget is spent (or
+ * the failure was never retryable).
+ *
+ * When the pre-acceptance recovery contract attaches, `timedOut` is forced
+ * FALSE even for timeout-flavored messages: heartbeat's finalize maps
+ * `timedOut` results to outcome "timed_out" and invokes
+ * scheduleBoundedRetryForRun only for outcome "failed", so timedOut:true
+ * would strand the errorFamily park and finalize the run terminally — exactly
+ * on the deploy-drain "gateway connect challenge timeout" path the park
+ * exists for. Semantically the run never started (pre-acceptance), so it did
+ * not "time out"; the errorCode keeps the openclaw_gateway_timeout flavor for
+ * observability. Post-acceptance results keep `timedOut` as-is (pre-existing
+ * semantics, no recovery contract).
+ */
+export function buildTerminalFailureResult(input: {
+  message: string;
+  agentAccepted: boolean;
+  latestResultPayload: unknown;
+  now?: Date;
+}): AdapterExecutionResult {
+  const { timedOut, pairingRequired, isTransient } = classifyGatewayRunError(input.message);
+  const recovery = isTransient ? transientExhaustionRecovery(input.agentAccepted, input.now) : null;
+  const detailedMessage = pairingRequired
+    ? `${input.message}. Approve the pending device in OpenClaw (for example: openclaw devices approve --latest --url <gateway-ws-url> --token <gateway-token>) and retry. Ensure this agent has a persisted adapterConfig.devicePrivateKeyPem so approvals are reused.`
+    : input.message;
+  return {
+    exitCode: 1,
+    signal: null,
+    timedOut: recovery ? false : timedOut,
+    errorMessage: detailedMessage,
+    errorCode: timedOut
+      ? "openclaw_gateway_timeout"
+      : pairingRequired
+        ? "openclaw_gateway_pairing_required"
+        : "openclaw_gateway_request_failed",
+    ...(recovery ?? {}),
+    resultJson: asRecord(input.latestResultPayload),
+  };
+}
+
 const SENSITIVE_LOG_KEY_PATTERN =
   /(^|[_-])(auth|authorization|token|secret|password|api[_-]?key|private[_-]?key)([_-]|$)|^x-openclaw-(auth|token)$/i;
 
@@ -1856,7 +1897,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         };
       }
 
-      const { timedOut, pairingRequired, isTransient } = classifyGatewayRunError(message);
+      const { pairingRequired, isTransient } = classifyGatewayRunError(message);
 
       if (
         pairingRequired &&
@@ -1907,29 +1948,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         continue;
       }
 
-      const detailedMessage = pairingRequired
-        ? `${message}. Approve the pending device in OpenClaw (for example: openclaw devices approve --latest --url <gateway-ws-url> --token <gateway-token>) and retry. Ensure this agent has a persisted adapterConfig.devicePrivateKeyPem so approvals are reused.`
-        : message;
-
-      await ctx.onLog("stderr", `[openclaw-gateway] request failed: ${detailedMessage}\n`);
-
-      return {
-        exitCode: 1,
-        signal: null,
-        timedOut,
-        errorMessage: detailedMessage,
-        errorCode: timedOut
-          ? "openclaw_gateway_timeout"
-          : pairingRequired
-            ? "openclaw_gateway_pairing_required"
-            : "openclaw_gateway_request_failed",
-        // A PRE-acceptance transient failure that exhausted the in-process
-        // budget stays recoverable server-side; post-acceptance failures and
-        // permanent config errors (pairing, bad URL) never carry a recovery
-        // contract.
-        ...(isTransient ? (transientExhaustionRecovery(agentAccepted) ?? {}) : {}),
-        resultJson: asRecord(latestResultPayload),
-      };
+      const terminalResult = buildTerminalFailureResult({ message, agentAccepted, latestResultPayload });
+      await ctx.onLog("stderr", `[openclaw-gateway] request failed: ${terminalResult.errorMessage}\n`);
+      return terminalResult;
     } finally {
       client.close();
     }
