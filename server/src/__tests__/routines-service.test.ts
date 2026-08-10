@@ -1,5 +1,5 @@
 import { createHmac, randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -1102,6 +1102,72 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
       replayWindowSec: 300,
     }, { userId: "board-user" });
     expect(unsigned.trigger.signingMode).toBe("none");
+  });
+
+  it("rejects agent revision restores that weaken a webhook trigger, but not user restores or tightening ones", async () => {
+    const { agentId, routine, svc } = await seedFixture();
+
+    // rev2: user-created webhook trigger with signing disabled; rev3: tightened.
+    const created = await svc.createTrigger(routine.id, {
+      kind: "webhook",
+      signingMode: "none",
+      replayWindowSec: 300,
+    }, { userId: "board-user" });
+    await svc.updateTrigger(created.trigger.id, { signingMode: "hmac_sha256" }, { userId: "board-user" });
+
+    const revisions = await svc.listRevisions(routine.id);
+    const weakRevision = revisions.find((revision) => revision.revisionNumber === 2)!;
+    const strongRevision = revisions.find((revision) => revision.revisionNumber === 3)!;
+    expect(weakRevision.snapshot.triggers[0]?.signingMode).toBe("none");
+
+    await expect(svc.restoreRevision(routine.id, weakRevision.id, { agentId })).rejects.toMatchObject({
+      status: 400,
+      details: { code: "agent_cannot_weaken_trigger_auth", field: "signingMode" },
+    });
+    await expect(db.select().from(routineTriggers).where(eq(routineTriggers.id, created.trigger.id)))
+      .resolves.toMatchObject([{ signingMode: "hmac_sha256" }]);
+
+    // The same restore stays open to a user actor.
+    await expect(svc.restoreRevision(routine.id, weakRevision.id, { userId: "board-user" }))
+      .resolves.toMatchObject({ restoredFromRevisionId: weakRevision.id });
+    await expect(db.select().from(routineTriggers).where(eq(routineTriggers.id, created.trigger.id)))
+      .resolves.toMatchObject([{ signingMode: "none" }]);
+
+    // An agent restore that tightens is allowed.
+    await expect(svc.restoreRevision(routine.id, strongRevision.id, { agentId }))
+      .resolves.toMatchObject({ restoredFromRevisionId: strongRevision.id });
+    await expect(db.select().from(routineTriggers).where(eq(routineTriggers.id, created.trigger.id)))
+      .resolves.toMatchObject([{ signingMode: "hmac_sha256" }]);
+  });
+
+  it("validates agent trigger updates against the row read under the routine lock, not the pre-lock read", async () => {
+    const { agentId, routine, svc } = await seedFixture();
+    const created = await svc.createTrigger(routine.id, {
+      kind: "webhook",
+      signingMode: "none",
+      replayWindowSec: 300,
+    }, { userId: "board-user" });
+
+    // Hold the routine lock, let the agent PATCH take its pre-lock read while the
+    // trigger is still "none" (equal strength, would pass), then tighten to hmac
+    // before releasing. The guard must reject against the fresh row.
+    let pending!: Promise<unknown>;
+    await db.transaction(async (tx) => {
+      await tx.execute(sql`select id from ${routines} where ${routines.id} = ${routine.id} for update`);
+      pending = svc.updateTrigger(created.trigger.id, { signingMode: "none" }, { agentId }).catch((err) => err);
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      await (tx as unknown as typeof db)
+        .update(routineTriggers)
+        .set({ signingMode: "hmac_sha256" })
+        .where(eq(routineTriggers.id, created.trigger.id));
+    });
+
+    await expect(pending).resolves.toMatchObject({
+      status: 400,
+      details: { code: "agent_cannot_weaken_trigger_auth", field: "signingMode" },
+    });
+    await expect(db.select().from(routineTriggers).where(eq(routineTriggers.id, created.trigger.id)))
+      .resolves.toMatchObject([{ signingMode: "hmac_sha256" }]);
   });
 
   it("wakes the assignee when a routine creates a fresh execution issue", async () => {

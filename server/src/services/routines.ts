@@ -2454,10 +2454,6 @@ export function routineService(
       const existing = await getTriggerById(id);
       if (!existing) return null;
 
-      if (existing.kind === "webhook") {
-        assertAgentCannotWeakenWebhookAuth(actor, patch, existing);
-      }
-
       let nextRunAt = existing.nextRunAt;
       let cronExpression = existing.cronExpression;
       let timezone = existing.timezone;
@@ -2487,16 +2483,28 @@ export function routineService(
       const result = await db.transaction(async (tx) => {
         const txDb = tx as unknown as Db;
         await tx.execute(sql`select id from ${routines} where ${routines.id} = ${existing.routineId} for update`);
+        // Re-read under the routine lock: validating against the pre-lock row
+        // would let two overlapping patches leapfrog the weaken check, and
+        // stale fallbacks would silently revert a concurrent tighten.
+        const fresh = await txDb
+          .select()
+          .from(routineTriggers)
+          .where(eq(routineTriggers.id, id))
+          .then((rows) => rows[0] ?? null);
+        if (!fresh) return null;
+        if (fresh.kind === "webhook") {
+          assertAgentCannotWeakenWebhookAuth(actor, patch, fresh);
+        }
         const [updated] = await txDb
           .update(routineTriggers)
           .set({
-            label: patch.label === undefined ? existing.label : patch.label,
-            enabled: patch.enabled ?? existing.enabled,
+            label: patch.label === undefined ? fresh.label : patch.label,
+            enabled: patch.enabled ?? fresh.enabled,
             cronExpression,
             timezone,
             nextRunAt,
-            signingMode: patch.signingMode === undefined ? existing.signingMode : patch.signingMode,
-            replayWindowSec: patch.replayWindowSec === undefined ? existing.replayWindowSec : patch.replayWindowSec,
+            signingMode: patch.signingMode === undefined ? fresh.signingMode : patch.signingMode,
+            replayWindowSec: patch.replayWindowSec === undefined ? fresh.replayWindowSec : patch.replayWindowSec,
             updatedByAgentId: actor.agentId ?? null,
             updatedByUserId: actor.userId ?? null,
             updatedAt: new Date(),
@@ -2723,6 +2731,15 @@ export function routineService(
             .from(routineTriggers)
             .where(and(eq(routineTriggers.companyId, locked.companyId), eq(routineTriggers.id, triggerSnapshot.id)))
             .then((rows) => rows[0] ?? null);
+          if (triggerSnapshot.kind === "webhook") {
+            // A restore is a trigger write too: without this, an agent could
+            // resurrect an old weak-signing snapshot around the create/update guard.
+            assertAgentCannotWeakenWebhookAuth(
+              actor,
+              { signingMode: triggerSnapshot.signingMode, replayWindowSec: triggerSnapshot.replayWindowSec },
+              current?.kind === "webhook" ? current : undefined,
+            );
+          }
           const webhookSecret = recreatedWebhookSecrets.get(triggerSnapshot.id);
           const restoredNextRunAt = triggerSnapshot.kind === "schedule" && triggerSnapshot.enabled
             && triggerSnapshot.cronExpression && triggerSnapshot.timezone
