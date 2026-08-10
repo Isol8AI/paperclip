@@ -56,7 +56,7 @@ import {
   syncRoutineVariablesWithTemplate,
 } from "@paperclipai/shared";
 import { trackRoutineRun } from "@paperclipai/shared/telemetry";
-import { conflict, forbidden, notFound, unauthorized, unprocessable } from "../errors.js";
+import { badRequest, conflict, forbidden, notFound, unauthorized, unprocessable } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 import { getTelemetryClient } from "../telemetry.js";
 import { getConfiguredSecretProvider } from "../secrets/configured-provider.js";
@@ -367,6 +367,47 @@ function assertScheduleCompatibleVariables(variables: RoutineVariable[]) {
     throw unprocessable(
       `Scheduled routines require defaults for required variables: ${missingDefaults.join(", ")}`,
     );
+  }
+}
+
+// Agent actors (per-agent API keys) may tighten webhook trigger auth but never
+// weaken it: the fire URL is public, so signing_mode "none" or an oversized
+// replay window leaves publicId entropy as the only auth. Human/board actors
+// are unrestricted. A null/undefined signingMode verifies as hmac_sha256 at
+// fire time, so it ranks strongest.
+const WEBHOOK_SIGNING_STRENGTH: Record<string, number> = {
+  none: 0,
+  bearer: 1,
+  hmac_sha256: 2,
+  github_hmac: 2,
+};
+const WEBHOOK_REPLAY_WINDOW_DEFAULT_SEC = 300;
+
+function assertAgentCannotWeakenWebhookAuth(
+  actor: Actor,
+  next: { signingMode?: string | null; replayWindowSec?: number | null },
+  existing?: { signingMode: string | null; replayWindowSec: number | null },
+) {
+  if (!actor.agentId) return;
+  const strength = (mode: string | null | undefined) =>
+    WEBHOOK_SIGNING_STRENGTH[mode ?? "hmac_sha256"] ?? 0;
+  if (next.signingMode !== undefined) {
+    const weakens = existing
+      ? strength(next.signingMode) < strength(existing.signingMode)
+      : next.signingMode === "none";
+    if (weakens) {
+      throw badRequest("Agents cannot weaken webhook trigger signing", {
+        code: "agent_cannot_weaken_trigger_auth",
+        field: "signingMode",
+      });
+    }
+  }
+  const maxReplayWindowSec = Math.max(WEBHOOK_REPLAY_WINDOW_DEFAULT_SEC, existing?.replayWindowSec ?? 0);
+  if (next.replayWindowSec != null && next.replayWindowSec > maxReplayWindowSec) {
+    throw badRequest("Agents cannot extend the webhook replay window beyond the default", {
+      code: "agent_cannot_weaken_trigger_auth",
+      field: "replayWindowSec",
+    });
   }
 }
 
@@ -2338,6 +2379,10 @@ export function routineService(
       const routine = await getRoutineById(routineId);
       if (!routine) throw notFound("Routine not found");
 
+      if (input.kind === "webhook") {
+        assertAgentCannotWeakenWebhookAuth(actor, input);
+      }
+
       let secretMaterial: RoutineTriggerSecretMaterial | null = null;
       let secretId: string | null = null;
       let publicId: string | null = null;
@@ -2408,6 +2453,10 @@ export function routineService(
     ): Promise<{ trigger: RoutineTrigger; revision: RoutineRevision } | null> => {
       const existing = await getTriggerById(id);
       if (!existing) return null;
+
+      if (existing.kind === "webhook") {
+        assertAgentCannotWeakenWebhookAuth(actor, patch, existing);
+      }
 
       let nextRunAt = existing.nextRunAt;
       let cronExpression = existing.cronExpression;
