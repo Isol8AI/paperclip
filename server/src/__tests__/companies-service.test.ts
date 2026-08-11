@@ -7,6 +7,7 @@ import {
   agents,
   agentWakeupRequests,
   builtInManagedResources,
+  cases,
   companies,
   companySkillVersions,
   companySkills,
@@ -79,6 +80,62 @@ describeEmbeddedPostgres("companyService", () => {
 
     const rows = await db.select({ issuePrefix: companies.issuePrefix }).from(companies);
     expect(rows.map((row) => row.issuePrefix).sort()).toEqual(["ARO", "AROA"]);
+  });
+
+  it("recomputes the issue prefix when renamed before any issue or case exists", async () => {
+    const created = await companyService(db).create({ name: "Prasiddha" });
+    expect(created.issuePrefix).toBe("PRA");
+
+    const renamed = await companyService(db).update(created.id, { name: "GooseTown" });
+    expect(renamed?.issuePrefix).toBe("GOO");
+    expect(renamed?.name).toBe("GooseTown");
+  });
+
+  it("suffixes the recomputed prefix when the new base is already taken", async () => {
+    await db.insert(companies).values({
+      name: "Goose Existing",
+      issuePrefix: "GOO",
+    });
+    const created = await companyService(db).create({ name: "Prasiddha" });
+
+    const renamed = await companyService(db).update(created.id, { name: "GooseTown" });
+    expect(renamed?.issuePrefix).toBe("GOOA");
+  });
+
+  it("keeps the issue prefix on rename once issues have been minted", async () => {
+    const created = await companyService(db).create({ name: "Prasiddha" });
+    await db
+      .update(companies)
+      .set({ issueCounter: 3 })
+      .where(eq(companies.id, created.id));
+
+    const renamed = await companyService(db).update(created.id, { name: "GooseTown" });
+    expect(renamed?.issuePrefix).toBe("PRA");
+    expect(renamed?.name).toBe("GooseTown");
+  });
+
+  it("keeps the issue prefix on rename once a case has been minted", async () => {
+    const created = await companyService(db).create({ name: "Prasiddha" });
+    await db.insert(cases).values({
+      companyId: created.id,
+      caseNumber: 1,
+      identifier: "PRA-C1",
+      caseType: "generic",
+      title: "First case",
+    });
+
+    const renamed = await companyService(db).update(created.id, { name: "GooseTown" });
+    expect(renamed?.issuePrefix).toBe("PRA");
+  });
+
+  it("does not touch the issue prefix on updates that keep the same name", async () => {
+    const created = await companyService(db).create({ name: "Prasiddha" });
+
+    const updated = await companyService(db).update(created.id, {
+      name: "Prasiddha",
+      description: "still the same name",
+    });
+    expect(updated?.issuePrefix).toBe("PRA");
   });
 
   it("auto-provisions one paused Reflection Coach bundle for a freshly created company", async () => {

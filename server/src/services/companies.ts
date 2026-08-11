@@ -1,4 +1,4 @@
-import { and, count, eq, gte, inArray, isNull, lt, notInArray, sql } from "drizzle-orm";
+import { and, count, eq, gte, inArray, isNull, like, lt, ne, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   companies,
@@ -12,6 +12,7 @@ import {
   agentWakeupRequests,
   budgetIncidents,
   budgetPolicies,
+  cases,
   decisionArchiveNotificationOutbox,
   decisionBundles,
   decisionQueueItems,
@@ -374,6 +375,23 @@ export function companyService(db: Db) {
     return false;
   }
 
+  async function issuePrefixForRename(tx: Pick<Db, "select">, companyId: string, name: string) {
+    const base = deriveIssuePrefixBase(name);
+    const taken = new Set(
+      (
+        await tx
+          .select({ issuePrefix: companies.issuePrefix })
+          .from(companies)
+          .where(and(like(companies.issuePrefix, `${base}%`), ne(companies.id, companyId)))
+      ).map((row) => row.issuePrefix),
+    );
+    for (let attempt = 1; attempt < 10000; attempt += 1) {
+      const candidate = `${base}${suffixForAttempt(attempt)}`;
+      if (!taken.has(candidate)) return candidate;
+    }
+    return null;
+  }
+
   async function createCompanyWithUniquePrefix(data: typeof companies.$inferInsert) {
     const base = deriveIssuePrefixBase(data.name);
     let suffix = 1;
@@ -433,6 +451,31 @@ export function companyService(db: Db) {
         if (!existing) return null;
 
         const { logoAssetId, ...companyPatch } = data;
+
+        // Companies are created under a placeholder name and the issue prefix
+        // freezes at insert. A rename that lands before anything has minted an
+        // identifier (no issues, no cases) re-derives the prefix from the name
+        // actually chosen; once identifiers exist the prefix is permanent.
+        if (
+          companyPatch.issuePrefix === undefined &&
+          typeof companyPatch.name === "string" &&
+          companyPatch.name.trim() !== "" &&
+          companyPatch.name !== existing.name &&
+          existing.issueCounter === 0
+        ) {
+          const [existingCase] = await tx
+            .select({ id: cases.id })
+            .from(cases)
+            .where(eq(cases.companyId, id))
+            .limit(1);
+          if (!existingCase) {
+            const candidate = await issuePrefixForRename(tx, id, companyPatch.name);
+            if (candidate && candidate !== existing.issuePrefix) {
+              companyPatch.issuePrefix = candidate;
+            }
+          }
+        }
+
         const willReactivate = existing.status !== "active" && companyPatch.status === "active";
         const willArchive = existing.status !== "archived" && companyPatch.status === "archived";
 
