@@ -183,5 +183,13 @@ export const runRoutineSchema = z.object({
 
 export type RunRoutine = z.infer<typeof runRoutineSchema>;
 
-export const rotateRoutineTriggerSecretSchema = z.object({});
+export const rotateRoutineTriggerSecretSchema = z.object({
+  // Optional caller-supplied secret. Omitted -> a fresh random secret is
+  // generated (the default "rotate my secret" behaviour). Supplied -> the
+  // trigger is armed with THIS exact value, for a provider that imposes its
+  // own webhook signing secret (e.g. a Stripe endpoint's whsec_) so its
+  // native signature verifies against it. Restricted to board actors
+  // server-side — agents may not choose a trigger secret.
+  secret: z.string().min(1).max(512).optional(),
+});
 export type RotateRoutineTriggerSecret = z.infer<typeof rotateRoutineTriggerSecretSchema>;
