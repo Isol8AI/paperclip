@@ -444,7 +444,7 @@ export function companyService(db: Db) {
       data: Partial<typeof companies.$inferInsert> & { logoAssetId?: string | null },
       actor: CompanyActivityActor = SYSTEM_COMPANY_ACTOR,
     ) => {
-      const result = await db.transaction(async (tx) => {
+      const runUpdateTx = () => db.transaction(async (tx) => {
         const existing = await getCompanyQuery(tx)
           .where(eq(companies.id, id))
           .then((rows) => rows[0] ?? null);
@@ -569,6 +569,20 @@ export function companyService(db: Db) {
           archiveCascade,
         };
       });
+      // The recomputed prefix is chosen by a pre-select inside the
+      // transaction, so a concurrent create/rename to the same base can win
+      // the unique index first. Re-running the transaction re-selects against
+      // the winner's committed row and picks the next free suffix — the same
+      // recovery the create path gets from its insert-retry loop.
+      let result: Awaited<ReturnType<typeof runUpdateTx>> = null;
+      for (let attempt = 1; ; attempt += 1) {
+        try {
+          result = await runUpdateTx();
+          break;
+        } catch (error) {
+          if (attempt >= 3 || !isIssuePrefixConflict(error)) throw error;
+        }
+      }
       if (!result) return null;
       if (result.reactivated) {
         await logActivity(db, {
