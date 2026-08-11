@@ -456,22 +456,35 @@ export function companyService(db: Db) {
         // freezes at insert. A rename that lands before anything has minted an
         // identifier (no issues, no cases) re-derives the prefix from the name
         // actually chosen; once identifiers exist the prefix is permanent.
+        //
+        // The emptiness check re-reads the counter under FOR UPDATE: issue
+        // creation increments companies.issueCounter (taking this same row
+        // lock), so a concurrent create either commits first — the re-read
+        // sees a non-zero counter and the prefix stays — or blocks until this
+        // rename commits and mints its identifier from the new prefix. The
+        // pre-lock `existing` read is not trustworthy for this decision.
         if (
           companyPatch.issuePrefix === undefined &&
           typeof companyPatch.name === "string" &&
           companyPatch.name.trim() !== "" &&
-          companyPatch.name !== existing.name &&
-          existing.issueCounter === 0
+          companyPatch.name !== existing.name
         ) {
-          const [existingCase] = await tx
-            .select({ id: cases.id })
-            .from(cases)
-            .where(eq(cases.companyId, id))
-            .limit(1);
-          if (!existingCase) {
-            const candidate = await issuePrefixForRename(tx, id, companyPatch.name);
-            if (candidate && candidate !== existing.issuePrefix) {
-              companyPatch.issuePrefix = candidate;
+          const [locked] = await tx
+            .select({ issueCounter: companies.issueCounter, issuePrefix: companies.issuePrefix })
+            .from(companies)
+            .where(eq(companies.id, id))
+            .for("update");
+          if (locked?.issueCounter === 0) {
+            const [existingCase] = await tx
+              .select({ id: cases.id })
+              .from(cases)
+              .where(eq(cases.companyId, id))
+              .limit(1);
+            if (!existingCase) {
+              const candidate = await issuePrefixForRename(tx, id, companyPatch.name);
+              if (candidate && candidate !== locked.issuePrefix) {
+                companyPatch.issuePrefix = candidate;
+              }
             }
           }
         }
