@@ -144,6 +144,16 @@ describeEmbeddedPostgres("companyService", () => {
     expect(new Set(prefixes).size).toBe(4);
   });
 
+  it("keeps allocating behind an allocator-external writer that already took the base", async () => {
+    // resolveCloudTenantActor inserts a company with its own stack-derived
+    // prefix without taking the allocator's lock. Whatever such a writer has
+    // committed must simply read as taken.
+    await db.insert(companies).values({ name: "Cloud Stack Tenant", issuePrefix: "GOO" });
+
+    const created = await companyService(db).create({ name: "GooseTown" });
+    expect(created.issuePrefix).toBe("GOOA");
+  });
+
   it("keeps the issue prefix on rename once issues have been minted", async () => {
     const created = await companyService(db).create({ name: "Prasiddha" });
     await db
