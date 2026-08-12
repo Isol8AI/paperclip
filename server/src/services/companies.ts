@@ -375,8 +375,21 @@ export function companyService(db: Db) {
     return false;
   }
 
-  async function issuePrefixForRename(tx: Pick<Db, "select">, companyId: string, name: string) {
+  async function issuePrefixForRename(
+    tx: Pick<Db, "select" | "execute">,
+    companyId: string,
+    name: string,
+  ) {
     const base = deriveIssuePrefixBase(name);
+    // Serialize allocation per derived base, the same way nextCaseIdentity
+    // serializes case numbering. Without it, concurrent renames to names
+    // sharing a base each pre-select the same free candidate and all but one
+    // lose the unique index — recoverable only by re-running whole
+    // transactions, which is both expensive and (with a bounded retry) not
+    // guaranteed to converge. Holding the lock, each rename's pre-select runs
+    // after the previous one has committed, so it sees that prefix as taken
+    // and picks the next suffix. Transaction-scoped: released at commit.
+    await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`paperclip:issue-prefix:${base}`}))`);
     const taken = new Set(
       (
         await tx
@@ -569,11 +582,14 @@ export function companyService(db: Db) {
           archiveCascade,
         };
       });
-      // The recomputed prefix is chosen by a pre-select inside the
-      // transaction, so a concurrent create/rename to the same base can win
-      // the unique index first. Re-running the transaction re-selects against
-      // the winner's committed row and picks the next free suffix — the same
-      // recovery the create path gets from its insert-retry loop.
+      // Renames against the same base are serialized by the advisory lock in
+      // issuePrefixForRename, so they never collide with each other. What the
+      // lock does NOT cover is the CREATE path, which allocates by
+      // insert-and-retry without taking it: a create can still land this
+      // base's next free prefix between our pre-select and our update. Each
+      // re-run re-selects against whatever committed and moves to the next
+      // suffix, and a create that steals one keeps advancing on its own, so a
+      // small bound is enough to converge here.
       let result: Awaited<ReturnType<typeof runUpdateTx>> = null;
       for (let attempt = 1; ; attempt += 1) {
         try {

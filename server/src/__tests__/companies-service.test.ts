@@ -102,6 +102,28 @@ describeEmbeddedPostgres("companyService", () => {
     expect(renamed?.issuePrefix).toBe("GOOA");
   });
 
+  it("allocates distinct prefixes when many empty boards are renamed to the same base at once", async () => {
+    // Codex's scenario: without per-base serialization each of these
+    // pre-selects the same free candidate, and all but one lose the unique
+    // index — a valid rename failing with a constraint error.
+    const svc = companyService(db);
+    const created = await Promise.all([
+      svc.create({ name: "Alpha One" }),
+      svc.create({ name: "Beta Two" }),
+      svc.create({ name: "Gamma Three" }),
+      svc.create({ name: "Delta Four" }),
+    ]);
+
+    const renamed = await Promise.all(
+      created.map((company, index) => svc.update(company.id, { name: `GooseTown ${index}` })),
+    );
+
+    const prefixes = renamed.map((row) => row?.issuePrefix).sort();
+    expect(prefixes).toEqual(["GOO", "GOOA", "GOOAA", "GOOAAA"]);
+    // Every rename kept its own row — no two companies share a prefix.
+    expect(new Set(prefixes).size).toBe(4);
+  });
+
   it("keeps the issue prefix on rename once issues have been minted", async () => {
     const created = await companyService(db).create({ name: "Prasiddha" });
     await db
