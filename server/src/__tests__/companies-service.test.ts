@@ -124,6 +124,26 @@ describeEmbeddedPostgres("companyService", () => {
     expect(new Set(prefixes).size).toBe(4);
   });
 
+  it("does not let concurrent creates steal the prefix a rename is allocating", async () => {
+    // Codex's follow-up scenario: creates allocate on the same base while a
+    // rename is choosing one. Both paths go through allocateIssuePrefix, so
+    // they serialize instead of racing the unique index.
+    const svc = companyService(db);
+    const toRename = await svc.create({ name: "Placeholder Name" });
+
+    const [renamed, ...creates] = await Promise.all([
+      svc.update(toRename.id, { name: "GooseTown" }),
+      svc.create({ name: "Goose Feathers" }),
+      svc.create({ name: "Goose Down" }),
+      svc.create({ name: "Goose Eggs" }),
+    ]);
+
+    const prefixes = [renamed?.issuePrefix, ...creates.map((row) => row.issuePrefix)];
+    // Every one succeeded and got a distinct prefix off the same base.
+    expect(prefixes.every((prefix) => prefix?.startsWith("GOO"))).toBe(true);
+    expect(new Set(prefixes).size).toBe(4);
+  });
+
   it("keeps the issue prefix on rename once issues have been minted", async () => {
     const created = await companyService(db).create({ name: "Prasiddha" });
     await db

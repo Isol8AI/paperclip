@@ -375,29 +375,37 @@ export function companyService(db: Db) {
     return false;
   }
 
-  async function issuePrefixForRename(
+  /** The single allocator BOTH the create and rename paths go through.
+   *
+   * Serializes on the derived base, the way nextCaseIdentity serializes case
+   * numbering. Without one shared lock, concurrent allocators each pre-select
+   * the same free candidate and all but one lose the unique index — and a
+   * bounded retry cannot be relied on to converge, because every round can be
+   * stolen again. Holding the lock, each allocation runs after the previous
+   * one committed, sees that prefix as taken, and takes the next suffix.
+   *
+   * Transaction-scoped, so it releases at commit: every caller MUST be inside
+   * a transaction, or the lock drops at statement end and buys nothing.
+   *
+   * ``excludeCompanyId`` is the row being renamed — its own current prefix
+   * must not count as taken.
+   */
+  async function allocateIssuePrefix(
     tx: Pick<Db, "select" | "execute">,
-    companyId: string,
     name: string,
+    excludeCompanyId?: string,
   ) {
     const base = deriveIssuePrefixBase(name);
-    // Serialize allocation per derived base, the same way nextCaseIdentity
-    // serializes case numbering. Without it, concurrent renames to names
-    // sharing a base each pre-select the same free candidate and all but one
-    // lose the unique index — recoverable only by re-running whole
-    // transactions, which is both expensive and (with a bounded retry) not
-    // guaranteed to converge. Holding the lock, each rename's pre-select runs
-    // after the previous one has committed, so it sees that prefix as taken
-    // and picks the next suffix. Transaction-scoped: released at commit.
     await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`paperclip:issue-prefix:${base}`}))`);
-    const taken = new Set(
-      (
-        await tx
-          .select({ issuePrefix: companies.issuePrefix })
-          .from(companies)
-          .where(and(like(companies.issuePrefix, `${base}%`), ne(companies.id, companyId)))
-      ).map((row) => row.issuePrefix),
-    );
+    const takenRows = await tx
+      .select({ issuePrefix: companies.issuePrefix })
+      .from(companies)
+      .where(
+        excludeCompanyId
+          ? and(like(companies.issuePrefix, `${base}%`), ne(companies.id, excludeCompanyId))
+          : like(companies.issuePrefix, `${base}%`),
+      );
+    const taken = new Set(takenRows.map((row) => row.issuePrefix));
     for (let attempt = 1; attempt < 10000; attempt += 1) {
       const candidate = `${base}${suffixForAttempt(attempt)}`;
       if (!taken.has(candidate)) return candidate;
@@ -406,22 +414,30 @@ export function companyService(db: Db) {
   }
 
   async function createCompanyWithUniquePrefix(data: typeof companies.$inferInsert) {
-    const base = deriveIssuePrefixBase(data.name);
-    let suffix = 1;
-    while (suffix < 10000) {
-      const candidate = `${base}${suffixForAttempt(suffix)}`;
-      try {
-        const rows = await db
-          .insert(companies)
-          .values({ ...data, issuePrefix: candidate })
-          .returning();
-        return rows[0];
-      } catch (error) {
-        if (!isIssuePrefixConflict(error)) throw error;
+    // Runs inside a transaction so the allocator's advisory lock holds until
+    // the insert commits — that is what stops a create from claiming the
+    // prefix a concurrent rename already selected, and vice versa. The
+    // insert-retry stays as the backstop for a conflict the pre-select could
+    // not have seen.
+    return db.transaction(async (tx) => {
+      const allocated = await allocateIssuePrefix(tx, data.name);
+      const base = allocated ?? deriveIssuePrefixBase(data.name);
+      let suffix = 0;
+      while (suffix < 10000) {
+        const candidate = suffix === 0 ? base : `${base}${suffixForAttempt(suffix + 1)}`;
+        try {
+          const rows = await tx
+            .insert(companies)
+            .values({ ...data, issuePrefix: candidate })
+            .returning();
+          return rows[0];
+        } catch (error) {
+          if (!isIssuePrefixConflict(error)) throw error;
+        }
+        suffix += 1;
       }
-      suffix += 1;
-    }
-    throw new Error("Unable to allocate unique issue prefix");
+      throw new Error("Unable to allocate unique issue prefix");
+    });
   }
 
   return {
@@ -494,7 +510,7 @@ export function companyService(db: Db) {
               .where(eq(cases.companyId, id))
               .limit(1);
             if (!existingCase) {
-              const candidate = await issuePrefixForRename(tx, id, companyPatch.name);
+              const candidate = await allocateIssuePrefix(tx, companyPatch.name, id);
               if (candidate && candidate !== locked.issuePrefix) {
                 companyPatch.issuePrefix = candidate;
               }
@@ -582,14 +598,13 @@ export function companyService(db: Db) {
           archiveCascade,
         };
       });
-      // Renames against the same base are serialized by the advisory lock in
-      // issuePrefixForRename, so they never collide with each other. What the
-      // lock does NOT cover is the CREATE path, which allocates by
-      // insert-and-retry without taking it: a create can still land this
-      // base's next free prefix between our pre-select and our update. Each
-      // re-run re-selects against whatever committed and moves to the next
-      // suffix, and a create that steals one keeps advancing on its own, so a
-      // small bound is enough to converge here.
+      // Every allocator — create and rename alike — now serializes on
+      // allocateIssuePrefix's per-base advisory lock, so a candidate chosen
+      // under the lock cannot be claimed by anyone else before this
+      // transaction commits. The retry is the belt-and-braces path for a
+      // conflict that lock cannot explain (a hand-written prefix, a future
+      // caller that allocates without it): re-running re-selects against
+      // whatever committed and moves to the next free suffix.
       let result: Awaited<ReturnType<typeof runUpdateTx>> = null;
       for (let attempt = 1; ; attempt += 1) {
         try {
