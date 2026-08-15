@@ -87,13 +87,12 @@ describeEmbeddedPostgres("agent create idempotency routes", () => {
     }).returning().then((rows) => rows[0]!);
   }
 
-  function agentBody(idempotencyKey?: string) {
+  function agentBody() {
     return {
       name: "Forge",
       role: "engineer",
       adapterType: "process",
       adapterConfig: {},
-      ...(idempotencyKey === undefined ? {} : { idempotencyKey }),
     };
   }
 
@@ -103,8 +102,8 @@ describeEmbeddedPostgres("agent create idempotency routes", () => {
     const path = `/api/companies/${company.id}/agents`;
 
     const [left, right] = await Promise.all([
-      request(app).post(path).send(agentBody("hire:forge:v1")),
-      request(app).post(path).send(agentBody("hire:forge:v1")),
+      request(app).post(path).set("Idempotency-Key", "hire:forge:v1").send(agentBody()),
+      request(app).post(path).set("Idempotency-Key", "hire:forge:v1").send(agentBody()),
     ]);
 
     expect([left.status, right.status].sort()).toEqual([200, 201]);
@@ -126,15 +125,61 @@ describeEmbeddedPostgres("agent create idempotency routes", () => {
     const app = createApp();
     const path = `/api/companies/${company.id}/agents`;
 
-    const first = await request(app).post(path).send(agentBody("hire:forge:v2")).expect(201);
-    const replay = await request(app).post(path).send({
-      ...agentBody("hire:forge:v2"),
-      name: "Retry payload must not create Forge 2",
-      adapterConfig: { command: "echo retry" },
-    }).expect(200);
+    const first = await request(app)
+      .post(path)
+      .set("Idempotency-Key", "hire:forge:v2")
+      .send(agentBody())
+      .expect(201);
+    const replay = await request(app)
+      .post(path)
+      .set("Idempotency-Key", "hire:forge:v2")
+      .send({
+        ...agentBody(),
+        name: "Retry payload must not create Forge 2",
+        adapterConfig: { command: "echo retry" },
+      })
+      .expect(200);
 
     expect(replay.body.id).toBe(first.body.id);
     expect(replay.body.name).toBe("Forge");
+    expect(await db.select().from(agents).where(eq(agents.companyId, company.id))).toHaveLength(1);
+  });
+
+  it("atomically refuses replay-only when the key has no existing operation", async () => {
+    const company = await seedCompany();
+    const app = createApp();
+    const path = `/api/companies/${company.id}/agents`;
+
+    const response = await request(app)
+      .post(path)
+      .set("Idempotency-Key", "hire:forge:missing")
+      .set("Idempotency-Replay-Only", "true")
+      .send(agentBody())
+      .expect(409);
+
+    expect(response.body.code).toBe("agent_create_idempotency_replay_miss");
+    expect(await db.select().from(agents).where(eq(agents.companyId, company.id))).toHaveLength(0);
+    expect(await db.select().from(agentCreateIdempotencyKeys)).toHaveLength(0);
+  });
+
+  it("allows replay-only to resume an existing operation without creating another agent", async () => {
+    const company = await seedCompany();
+    const app = createApp();
+    const path = `/api/companies/${company.id}/agents`;
+    const first = await request(app)
+      .post(path)
+      .set("Idempotency-Key", "hire:forge:existing")
+      .send(agentBody())
+      .expect(201);
+
+    const replay = await request(app)
+      .post(path)
+      .set("Idempotency-Key", "hire:forge:existing")
+      .set("Idempotency-Replay-Only", "true")
+      .send(agentBody())
+      .expect(200);
+
+    expect(replay.body.id).toBe(first.body.id);
     expect(await db.select().from(agents).where(eq(agents.companyId, company.id))).toHaveLength(1);
   });
 
@@ -151,8 +196,9 @@ describeEmbeddedPostgres("agent create idempotency routes", () => {
     await request(app)
       .post(path)
       .set("x-test-user-id", "original-user")
+      .set("Idempotency-Key", key)
       .send({
-        ...agentBody(key),
+        ...agentBody(),
         adapterType: "claude_local",
         instructionsBundle: { files: { "AGENTS.md": "Original instructions" } },
       })
@@ -181,8 +227,9 @@ describeEmbeddedPostgres("agent create idempotency routes", () => {
     const replay = await request(app)
       .post(path)
       .set("x-test-user-id", "retry-user")
+      .set("Idempotency-Key", key)
       .send({
-        ...agentBody(key),
+        ...agentBody(),
         adapterType: "claude_local",
         instructionsBundle: { files: { "AGENTS.md": "Retry instructions must not win" } },
       })
@@ -210,11 +257,13 @@ describeEmbeddedPostgres("agent create idempotency routes", () => {
 
     const first = await request(app)
       .post(`/api/companies/${firstCompany.id}/agents`)
-      .send(agentBody("hire:forge:shared"))
+      .set("Idempotency-Key", "hire:forge:shared")
+      .send(agentBody())
       .expect(201);
     const second = await request(app)
       .post(`/api/companies/${secondCompany.id}/agents`)
-      .send(agentBody("hire:forge:shared"))
+      .set("Idempotency-Key", "hire:forge:shared")
+      .send(agentBody())
       .expect(201);
     const noKeyOne = await request(app)
       .post(`/api/companies/${firstCompany.id}/agents`)
@@ -233,9 +282,17 @@ describeEmbeddedPostgres("agent create idempotency routes", () => {
     const app = createApp();
     const path = `/api/companies/${company.id}/agents`;
 
-    const first = await request(app).post(path).send(agentBody("hire:forge:delete-reuse")).expect(201);
+    const first = await request(app)
+      .post(path)
+      .set("Idempotency-Key", "hire:forge:delete-reuse")
+      .send(agentBody())
+      .expect(201);
     await db.delete(agents).where(eq(agents.id, first.body.id));
-    const recreated = await request(app).post(path).send(agentBody("hire:forge:delete-reuse")).expect(201);
+    const recreated = await request(app)
+      .post(path)
+      .set("Idempotency-Key", "hire:forge:delete-reuse")
+      .send(agentBody())
+      .expect(201);
 
     expect(recreated.body.id).not.toBe(first.body.id);
     expect(recreated.body.name).toBe("Forge");
@@ -246,8 +303,19 @@ describeEmbeddedPostgres("agent create idempotency routes", () => {
     const app = createApp();
     const path = `/api/companies/${company.id}/agents`;
 
-    await request(app).post(path).send(agentBody("   ")).expect(400);
-    await request(app).post(path).send(agentBody("x".repeat(256))).expect(400);
+    await request(app).post(path).set("Idempotency-Key", "").send(agentBody()).expect(422);
+    await request(app).post(path).set("Idempotency-Key", "x".repeat(256)).send(agentBody()).expect(422);
+    await request(app)
+      .post(path)
+      .set("Idempotency-Replay-Only", "true")
+      .send(agentBody())
+      .expect(422);
+    await request(app)
+      .post(path)
+      .set("Idempotency-Key", "hire:forge:invalid-mode")
+      .set("Idempotency-Replay-Only", "sometimes")
+      .send(agentBody())
+      .expect(422);
     expect(await db.select().from(agents)).toHaveLength(0);
   });
 });

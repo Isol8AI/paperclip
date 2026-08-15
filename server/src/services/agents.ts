@@ -602,6 +602,7 @@ export function agentService(db: Db) {
         agent: NonNullable<Awaited<ReturnType<typeof getById>>>;
         completionPayload: Record<string, unknown>;
       }>,
+      options?: { replayOnly?: boolean },
     ) => {
       const normalizedKey = idempotencyKey.trim();
       if (!normalizedKey) throw unprocessable("Idempotency key is required");
@@ -632,6 +633,13 @@ export function agentService(db: Db) {
             replayed: true,
             completed: existingAgentId.completedAt !== null,
           };
+        }
+
+        if (options?.replayOnly) {
+          throw conflict(
+            "No existing agent create operation matches this idempotency key",
+            { code: "agent_create_idempotency_replay_miss" },
+          );
         }
 
         const txDb = tx as unknown as Db;

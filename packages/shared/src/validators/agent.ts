@@ -87,7 +87,10 @@ const createAgentInputSchema = z.object({
 });
 
 export const createAgentSchema = createAgentInputSchema.extend({
-  idempotencyKey: z.string().trim().min(1).max(255).optional(),
+  // Agent-create idempotency is an HTTP-header contract. Reject body aliases
+  // so one logical operation cannot accidentally carry two competing keys.
+  idempotencyKey: z.never().optional(),
+  idempotencyReplayOnly: z.never().optional(),
 });
 
 export type CreateAgent = z.infer<typeof createAgentSchema>;
@@ -112,6 +115,7 @@ export type BuiltInAgentReset = z.infer<typeof builtInAgentResetSchema>;
 
 export const createAgentHireSchema = createAgentInputSchema.extend({
   idempotencyKey: z.never().optional(),
+  idempotencyReplayOnly: z.never().optional(),
   sourceIssueId: z.string().uuid().optional().nullable(),
   sourceIssueIds: z.array(z.string().uuid()).optional(),
 });
@@ -123,6 +127,7 @@ export const updateAgentSchema = createAgentInputSchema
   .partial()
   .extend({
     idempotencyKey: z.never().optional(),
+    idempotencyReplayOnly: z.never().optional(),
     permissions: z.never().optional(),
     replaceAdapterConfig: z.boolean().optional(),
     status: z.enum(AGENT_STATUSES).optional(),

@@ -30,6 +30,22 @@ describe("dynamic adapter type validation schemas", () => {
         adapterType: "   ",
       }),
     ).toThrow();
+    expect(() =>
+      createAgentHireSchema.parse({
+        name: "Pending Agent",
+        adapterType: "process",
+        idempotencyKey: "unsupported:hire",
+      }),
+    ).toThrow();
+    expect(() =>
+      createAgentHireSchema.parse({
+        name: "Pending Agent",
+        adapterType: "process",
+        idempotencyReplayOnly: true,
+      }),
+    ).toThrow();
+    expect(() => updateAgentSchema.parse({ idempotencyKey: "unsupported:patch" })).toThrow();
+    expect(() => updateAgentSchema.parse({ idempotencyReplayOnly: true })).toThrow();
   });
 
   it("accepts an explicit managed instructions bundle for new agents", () => {
@@ -46,21 +62,21 @@ describe("dynamic adapter type validation schemas", () => {
     ).toBe("Use AGENTS.md.");
   });
 
-  it("limits create idempotency keys to the direct-create contract", () => {
-    expect(
+  it("rejects body aliases for the agent-create idempotency headers", () => {
+    expect(() =>
       createAgentSchema.parse({
         name: "Idempotent Agent",
         adapterType: "process",
         idempotencyKey: "hire:agent:v1",
-      }).idempotencyKey,
-    ).toBe("hire:agent:v1");
-
-    expect(() => createAgentHireSchema.parse({
-      name: "Pending Agent",
-      adapterType: "process",
-      idempotencyKey: "unsupported:hire",
-    })).toThrow();
-    expect(() => updateAgentSchema.parse({ idempotencyKey: "unsupported:patch" })).toThrow();
+      }),
+    ).toThrow();
+    expect(() =>
+      createAgentSchema.parse({
+        name: "Replay Agent",
+        adapterType: "process",
+        idempotencyReplayOnly: true,
+      }),
+    ).toThrow();
   });
 
   it("accepts external adapter types in invite acceptance schema", () => {

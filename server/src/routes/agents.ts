@@ -3197,8 +3197,22 @@ export function agentRoutes(
       );
     }
 
+    const rawIdempotencyKey = req.header("Idempotency-Key");
+    const idempotencyKey = rawIdempotencyKey?.trim() || null;
+    if (rawIdempotencyKey !== undefined && (!idempotencyKey || idempotencyKey.length > 255)) {
+      throw unprocessable("Idempotency-Key must contain between 1 and 255 characters");
+    }
+    const rawReplayOnly = req.header("Idempotency-Replay-Only");
+    const normalizedReplayOnly = rawReplayOnly?.trim().toLowerCase();
+    if (normalizedReplayOnly !== undefined && !["true", "false"].includes(normalizedReplayOnly)) {
+      throw unprocessable("Idempotency-Replay-Only must be true or false");
+    }
+    const idempotencyReplayOnly = normalizedReplayOnly === "true";
+    if (idempotencyReplayOnly && !idempotencyKey) {
+      throw unprocessable("Idempotency-Replay-Only requires Idempotency-Key");
+    }
+
     const {
-      idempotencyKey,
       desiredSkills: requestedDesiredSkills,
       instructionsBundle,
       ...createInput
@@ -3279,7 +3293,9 @@ export function agentRoutes(
     };
 
     const createResult = idempotencyKey
-      ? await svc.createIdempotently(companyId, idempotencyKey, createAgent)
+      ? await svc.createIdempotently(companyId, idempotencyKey, createAgent, {
+        replayOnly: idempotencyReplayOnly === true,
+      })
       : { ...(await createAgent(db)), replayed: false, completed: false };
 
     const completeAgentCreate = async (
