@@ -29,6 +29,7 @@ import {
 import type {
   CreateRoutine,
   CreateRoutineTrigger,
+  IssueExecutionPolicy,
   Routine,
   RoutineDetail,
   RoutineDescriptionDocument,
@@ -62,6 +63,7 @@ import { logger } from "../middleware/logger.js";
 import { getTelemetryClient } from "../telemetry.js";
 import { getConfiguredSecretProvider } from "../secrets/configured-provider.js";
 import { issueService } from "./issues.js";
+import { normalizeIssueExecutionPolicy } from "./issue-execution-policy.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import { secretService } from "./secrets.js";
@@ -574,6 +576,10 @@ function routineRevisionSnapshotRoutine(routine: RoutineRow): RoutineRevisionSna
     variables: routine.variables ?? [],
     env: routine.env ?? null,
     responsibleUserId: routine.responsibleUserId ?? null,
+    // Spread, not `?? null`: a policy-less routine must serialize exactly as it
+    // did before this field existed, or `snapshotsMatch` reports every stored
+    // revision as changed and the next edit mints a spurious revision.
+    ...(routine.executionPolicy ? { executionPolicy: routine.executionPolicy } : {}),
   };
 }
 
@@ -608,8 +614,25 @@ async function buildRoutineRevisionSnapshot(
   };
 }
 
+// Key-order-insensitive: one side of a snapshot compare is often a fresh JS
+// object (normalizer insertion order) and the other a Postgres jsonb round-trip
+// (jsonb sorts keys), so raw JSON.stringify reports every echoed-back policy as
+// changed — minting a revision, and a 409, on every GET→PATCH echo. Arrays keep
+// their order; only object keys are sorted.
+function sortKeysDeep(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sortKeysDeep);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+        .map(([key, entry]) => [key, sortKeysDeep(entry)]),
+    );
+  }
+  return value;
+}
+
 function canonicalSnapshot(value: RoutineRevisionSnapshotV1) {
-  return JSON.stringify(value);
+  return JSON.stringify(sortKeysDeep(value));
 }
 
 function snapshotsMatch(left: RoutineRevisionSnapshotV1, right: RoutineRevisionSnapshotV1) {
@@ -1021,6 +1044,52 @@ export function routineService(
       .then((rows) => rows[0] ?? null);
     if (!project) throw notFound("Project not found");
     if (project.companyId !== companyId) throw unprocessable("Project must belong to same company");
+  }
+
+  /**
+   * Validate + canonicalize the issue execution policy a routine stamps onto
+   * every run issue it generates.
+   *
+   * Shape validation is `normalizeIssueExecutionPolicy` — the same function the
+   * issue routes use, so a routine policy and a hand-set issue policy are
+   * byte-identical once stored. On top of that, every agent reviewer/approver
+   * is put through `assertAssignableAgent`, which is what rejects an agent from
+   * another company (or a terminated / unapproved one) everywhere else.
+   *
+   * Returns null for a policy-less routine, which is the pre-existing state.
+   */
+  async function normalizeRoutineExecutionPolicy(
+    companyId: string,
+    input: unknown,
+    executor: Db = db,
+  ): Promise<IssueExecutionPolicy | null> {
+    const policy = normalizeIssueExecutionPolicy(input ?? null);
+    if (!policy) return null;
+    if (policy.monitor) {
+      // A monitor can only attach to an in_progress/in_review issue, and every
+      // routine run issue is born "todo" — a stored monitor would make
+      // buildInitialIssueMonitorFields throw on EVERY dispatch, fail-looping
+      // the routine into an auto-pause. Reject up front rather than stripping
+      // silently: the saver should know the monitor will not be honored.
+      throw unprocessable("Routine execution policies cannot schedule a monitor", {
+        field: "executionPolicy.monitor",
+      });
+    }
+    for (const stage of policy.stages) {
+      for (const participant of stage.participants) {
+        if (participant.type !== "agent") {
+          // ponytail: v1 restriction — agent participants only. No membership
+          // check exists on this path, so a typo'd or departed userId would
+          // pass save and park every generated run in_review forever. Lift
+          // when user participants can be validated like agents are.
+          throw unprocessable("Routine execution policies support agent participants only", {
+            field: "executionPolicy.stages.participants",
+          });
+        }
+        await assertAssignableAgent(executor, companyId, participant.agentId, { kind: "work" });
+      }
+    }
+    return policy;
   }
 
   async function assertGoal(companyId: string, goalId: string) {
@@ -1855,6 +1924,25 @@ export function routineService(
 
       let createdIssue: Awaited<ReturnType<typeof issueSvc.create>> | null = null;
       try {
+        // Reviewers are as long-lived as the default agent and go stale the same
+        // way, so revalidate the STORED policy rather than forwarding it blind:
+        // a reviewer terminated since the routine was saved would otherwise be
+        // stamped onto an issue that can never leave review.
+        //
+        // Deliberately fails the run rather than dropping the dead stage and
+        // running unreviewed — silently shipping work the owner gated on review
+        // is the worse, and invisible, failure.
+        //
+        // Deliberately INSIDE this try, not beside the default-agent check
+        // before the transaction. The catch below is what persists the failed
+        // run and increments the circuit breaker, so throwing earlier would
+        // fail silently: no run row, no breaker tick. Worse, on a scheduled
+        // tick `nextRunAt` has already been advanced and an escaping rejection
+        // aborts every remaining due routine in that tick.
+        //
+        // It also sits AFTER the coalesce/skip return below, because those
+        // paths mint no issue and so need no reviewer — a dead reviewer must
+        // not turn a run that would have coalesced into a failure.
         const activeIssue = await findLiveExecutionIssue(input.routine, txDb, dispatchFingerprint, {
           kind: issueOriginKind,
           id: issueOriginId,
@@ -1886,6 +1974,12 @@ export function routineService(
           return updated ?? createdRun;
         }
 
+        const executionPolicy = await normalizeRoutineExecutionPolicy(
+          input.routine.companyId,
+          input.routine.executionPolicy ?? null,
+          txDb,
+        );
+
         try {
           createdIssue = await issueSvc.create(input.routine.companyId, {
             projectId,
@@ -1909,6 +2003,14 @@ export function routineService(
             executionWorkspaceId: input.executionWorkspaceId ?? null,
             executionWorkspacePreference: input.executionWorkspacePreference ?? null,
             executionWorkspaceSettings: input.executionWorkspaceSettings ?? null,
+            // Spread, not `?? null`: a policy-less routine must hand issueSvc.create
+            // exactly the input it got before this field existed.
+            // Cast because the issues.execution_policy column is typed as the
+            // open `Record<string, unknown>` jsonb, not the IssueExecutionPolicy
+            // interface (which has no index signature).
+            ...(executionPolicy
+              ? { executionPolicy: executionPolicy as unknown as Record<string, unknown> }
+              : {}),
           });
         } catch (error) {
           const isOpenExecutionConflict =
@@ -2183,6 +2285,7 @@ export function routineService(
       await assertProject(companyId, input.projectId ?? null);
       await assertRoutineFolder(companyId, input.folderId ?? null);
       await assertAssignableAgent(db, companyId, input.assigneeAgentId ?? null, { kind: "routine" });
+      const executionPolicy = await normalizeRoutineExecutionPolicy(companyId, input.executionPolicy ?? null);
       if (input.goalId) await assertGoal(companyId, input.goalId);
       if (input.parentIssueId) await assertParentIssue(companyId, input.parentIssueId);
       const env = input.env === undefined || input.env === null
@@ -2222,6 +2325,7 @@ export function routineService(
             activityGateScope: input.activityGateScope ?? "company",
             variables,
             env,
+            executionPolicy,
             responsibleUserId,
             createdByAgentId: actor.agentId ?? null,
             createdByUserId: actor.userId ?? null,
@@ -2261,9 +2365,29 @@ export function routineService(
               strictMode: process.env.PAPERCLIP_SECRETS_STRICT_MODE === "true",
               fieldPath: "env",
             });
+      // Same posture as assertAgentCannotWeakenWebhookAuth: the review gate is
+      // the owner's control over the agent's output, so the assignee agent must
+      // not be able to remove (or rewrite) it on its own routine. Board/user
+      // actors are unrestricted; setting AND clearing are both blocked because
+      // a swap to a friendlier reviewer weakens the gate as surely as null.
+      if (actor.agentId && patch.executionPolicy !== undefined) {
+        throw forbidden("Agents cannot modify routine execution policies", {
+          code: "agent_cannot_modify_execution_policy",
+        });
+      }
+      const nextExecutionPolicy = patch.executionPolicy === undefined
+        ? undefined
+        : await normalizeRoutineExecutionPolicy(existing.companyId, patch.executionPolicy);
       const requestedStatus = patch.status ?? existing.status;
       if (patch.status === "active") {
         assertRoutineCanEnable(patch.status, nextAssigneeAgentId);
+        // Re-enabling puts the stored policy back in force, and its reviewers
+        // may have died while the routine was paused — the assignee gets
+        // revalidated below, so the reviewers must be too, or the routine
+        // re-enables straight into a dispatch fail-loop.
+        if (patch.executionPolicy === undefined && existing.executionPolicy) {
+          await normalizeRoutineExecutionPolicy(existing.companyId, existing.executionPolicy);
+        }
       }
       const nextStatus = patch.assigneeAgentId === undefined
         ? requestedStatus
@@ -2337,6 +2461,7 @@ export function routineService(
           activityGateScope: patch.activityGateScope ?? locked.activityGateScope,
           variables: nextVariables,
           env: nextEnv,
+          executionPolicy: nextExecutionPolicy === undefined ? locked.executionPolicy : nextExecutionPolicy,
           responsibleUserId: locked.responsibleUserId ?? responsibleUserId,
           updatedByAgentId: actor.agentId ?? null,
           updatedByUserId: actor.userId ?? null,
@@ -2344,6 +2469,19 @@ export function routineService(
 
         const folderChanged = patch.folderId !== undefined && locked.folderId !== candidate.folderId;
         if (locked.latestRevisionId && routineCurrentFieldsMatch(locked, candidate)) {
+          // Same repair the snapshot-match no-op below performs: an echoed env
+          // must still re-sync secret bindings (drift repair). This guard used
+          // to be unreachable for echoed jsonb because the raw stringify never
+          // matched key order; now that the compare is canonical it is the
+          // common no-op path, so it must not skip the sync.
+          if (patch.env !== undefined) {
+            await secretsSvc.syncEnvBindingsForTarget(
+              locked.companyId,
+              { targetType: "routine", targetId: locked.id },
+              candidate.env,
+              { db: tx },
+            );
+          }
           if (!folderChanged) return locked;
           const [updated] = await txDb
             .update(routines)
@@ -2407,6 +2545,7 @@ export function routineService(
             activityGateScope: candidate.activityGateScope,
             variables: candidate.variables,
             env: candidate.env,
+            executionPolicy: candidate.executionPolicy,
             responsibleUserId: candidate.responsibleUserId,
             updatedByAgentId: actor.agentId ?? null,
             updatedByUserId: actor.userId ?? null,
@@ -2716,6 +2855,17 @@ export function routineService(
       const snapshot = routineRevisionSnapshotSchema.parse(targetRevision.snapshot) as RoutineRevisionSnapshotV1;
       const routineSnapshot = snapshot.routine;
       await assertRestorableAssignee(existingRoutine.companyId, routineSnapshot.assigneeAgentId, actor);
+      // Same reason the assignee is checked above: an old revision can name a
+      // reviewer who has since been terminated or deleted, and restoring it
+      // would report success while installing a policy whose first generated
+      // issue cannot leave review. Re-normalizing here also strips the zod
+      // defaults `routineRevisionSnapshotSchema.parse()` applies
+      // (`maxReviewRounds: null`), which the normalizer omits — storing the
+      // parsed shape verbatim would leave a policy no other write path emits.
+      const restoredExecutionPolicy = await normalizeRoutineExecutionPolicy(
+        existingRoutine.companyId,
+        routineSnapshot.executionPolicy ?? null,
+      );
 
       const result = await db.transaction(async (tx) => {
         const txDb = tx as unknown as Db;
@@ -2772,6 +2922,7 @@ export function routineService(
             activityGateScope: routineSnapshot.activityGateScope,
             variables: routineSnapshot.variables,
             env: routineSnapshot.env,
+            executionPolicy: restoredExecutionPolicy,
             updatedByAgentId: actor.agentId ?? null,
             updatedByUserId: actor.userId ?? null,
             updatedAt: now,
