@@ -1635,6 +1635,7 @@ export {
   agentSkillSnapshotSchema,
   agentSkillSyncSchema,
   type AgentSkillSync,
+  createAgentInstructionsBundleSchema,
   createAgentSchema,
   builtInAgentEmptyMutationSchema,
   builtInAgentProvisionSchema,

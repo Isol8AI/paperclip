@@ -3,6 +3,7 @@ import { and, desc, eq, gte, inArray, lt, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
+  agentCreateIdempotencyKeys,
   agentConfigRevisions,
   agentApiKeys,
   agentRuntimeState,
@@ -593,6 +594,115 @@ export function agentService(db: Db) {
     },
 
     getById,
+
+    createIdempotently: async (
+      companyId: string,
+      idempotencyKey: string,
+      create: (txDb: Db) => Promise<{
+        agent: NonNullable<Awaited<ReturnType<typeof getById>>>;
+        completionPayload: Record<string, unknown>;
+      }>,
+      options?: { replayOnly?: boolean },
+    ) => {
+      const normalizedKey = idempotencyKey.trim();
+      if (!normalizedKey) throw unprocessable("Idempotency key is required");
+
+      return db.transaction(async (tx) => {
+        const guardKey = `agent-create:idempotency:${companyId}:${normalizedKey}`;
+        await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${guardKey}, 0))`);
+
+        const existingAgentId = await tx
+          .select({
+            agentId: agentCreateIdempotencyKeys.agentId,
+            completionPayload: agentCreateIdempotencyKeys.completionPayload,
+            completedAt: agentCreateIdempotencyKeys.completedAt,
+          })
+          .from(agentCreateIdempotencyKeys)
+          .where(and(
+            eq(agentCreateIdempotencyKeys.companyId, companyId),
+            eq(agentCreateIdempotencyKeys.idempotencyKey, normalizedKey),
+          ))
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+        if (existingAgentId) {
+          const existingAgent = await agentService(tx as unknown as Db).getById(existingAgentId.agentId);
+          if (!existingAgent) throw conflict("Idempotent agent create target no longer exists");
+          return {
+            agent: existingAgent,
+            completionPayload: existingAgentId.completionPayload,
+            replayed: true,
+            completed: existingAgentId.completedAt !== null,
+          };
+        }
+
+        if (options?.replayOnly) {
+          throw conflict(
+            "No existing agent create operation matches this idempotency key",
+            { code: "agent_create_idempotency_replay_miss" },
+          );
+        }
+
+        const txDb = tx as unknown as Db;
+        const { agent, completionPayload } = await create(txDb);
+        await tx.insert(agentCreateIdempotencyKeys).values({
+          companyId,
+          idempotencyKey: normalizedKey,
+          agentId: agent.id,
+          completionPayload,
+        });
+        return { agent, completionPayload, replayed: false, completed: false };
+      });
+    },
+
+    completeCreateIdempotently: async (
+      companyId: string,
+      idempotencyKey: string,
+      complete: (
+        agent: NonNullable<Awaited<ReturnType<typeof getById>>>,
+        completionPayload: Record<string, unknown>,
+      ) => Promise<NonNullable<Awaited<ReturnType<typeof getById>>>>,
+    ) => {
+      const normalizedKey = idempotencyKey.trim();
+      if (!normalizedKey) throw unprocessable("Idempotency key is required");
+
+      return db.transaction(async (tx) => {
+        const guardKey = `agent-create:idempotency:${companyId}:${normalizedKey}`;
+        await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${guardKey}, 0))`);
+
+        const record = await tx
+          .select({
+            agentId: agentCreateIdempotencyKeys.agentId,
+            completionPayload: agentCreateIdempotencyKeys.completionPayload,
+            completedAt: agentCreateIdempotencyKeys.completedAt,
+          })
+          .from(agentCreateIdempotencyKeys)
+          .where(and(
+            eq(agentCreateIdempotencyKeys.companyId, companyId),
+            eq(agentCreateIdempotencyKeys.idempotencyKey, normalizedKey),
+          ))
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+        if (!record) throw notFound("Agent create idempotency record not found");
+
+        const existingAgent = await agentService(tx as unknown as Db).getById(record.agentId);
+        if (!existingAgent) throw conflict("Idempotent agent create target no longer exists");
+        if (record.completedAt) return { agent: existingAgent, completed: false };
+
+        const completedAgent = await complete(existingAgent, record.completionPayload);
+        await tx
+          .update(agentCreateIdempotencyKeys)
+          .set({
+            completedAt: new Date(),
+            // Recovery data can include agent instructions; it is no longer needed after completion.
+            completionPayload: {},
+          })
+          .where(and(
+            eq(agentCreateIdempotencyKeys.companyId, companyId),
+            eq(agentCreateIdempotencyKeys.idempotencyKey, normalizedKey),
+          ));
+        return { agent: completedAgent, completed: true };
+      });
+    },
 
     create: async (companyId: string, data: Omit<typeof agents.$inferInsert, "companyId">, options?: CreateAgentOptions) => {
       assertBuiltInAgentMetadataMutationAllowed(null, data.metadata, options);
