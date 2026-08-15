@@ -63,10 +63,17 @@ import {
   HistorySection,
 } from "../components/routine-sections/operate-sections";
 import type {
+  IssueExecutionPolicy,
   RoutineDetail as RoutineDetailType,
   RoutineEnvConfig,
   RoutineVariable,
 } from "@paperclipai/shared";
+import {
+  buildExecutionPolicy,
+  principalFromSelectionValue,
+  selectionValueFromPrincipal,
+  stageParticipantValues,
+} from "../lib/issue-execution-policy";
 
 const LAST_SECTION_STORAGE_KEY = "paperclip.routineLastSection";
 
@@ -143,13 +150,28 @@ function getLocalTimezone(): string {
   }
 }
 
-function buildRoutineMutationPayload(input: RoutineEditDraft) {
+/** The single review-stage agent a routine's execution policy names, if any. */
+export function routineReviewerAgentId(policy: IssueExecutionPolicy | null | undefined): string {
+  return principalFromSelectionValue(stageParticipantValues(policy, "review")[0] ?? "")?.agentId ?? "";
+}
+
+export function buildRoutineMutationPayload(input: RoutineEditDraft, existingPolicy: IssueExecutionPolicy | null) {
+  const { reviewerAgentId, ...rest } = input;
   return {
-    ...input,
+    ...rest,
     description: input.description.trim() || null,
     projectId: input.projectId || null,
     assigneeAgentId: input.assigneeAgentId || null,
     env: input.env && Object.keys(input.env).length > 0 ? input.env : null,
+    // existingPolicy carries the approval stage (and monitor) through untouched
+    // — this form only edits the review stage.
+    executionPolicy: buildExecutionPolicy({
+      existingPolicy,
+      reviewerValues: reviewerAgentId
+        ? [selectionValueFromPrincipal({ type: "agent", agentId: reviewerAgentId, userId: null })]
+        : [],
+      approverValues: stageParticipantValues(existingPolicy, "approval"),
+    }),
   };
 }
 
@@ -174,6 +196,7 @@ export function RoutineDetail() {
     description: "",
     projectId: "",
     assigneeAgentId: "",
+    reviewerAgentId: "",
     priority: "medium",
     concurrencyPolicy: "coalesce_if_active",
     catchUpPolicy: "skip_missed",
@@ -268,6 +291,7 @@ export function RoutineDetail() {
             description: routine.description ?? "",
             projectId: routine.projectId ?? "",
             assigneeAgentId: routine.assigneeAgentId ?? "",
+            reviewerAgentId: routineReviewerAgentId(routine.executionPolicy),
             priority: routine.priority,
             concurrencyPolicy: routine.concurrencyPolicy,
             catchUpPolicy: routine.catchUpPolicy,
@@ -291,6 +315,9 @@ export function RoutineDetail() {
     }
     if (editDraft.assigneeAgentId !== routineDefaults.assigneeAgentId) {
       result.push({ key: "assigneeAgentId", label: "the default agent" });
+    }
+    if (editDraft.reviewerAgentId !== routineDefaults.reviewerAgentId) {
+      result.push({ key: "reviewerAgentId", label: "the reviewer" });
     }
     if (editDraft.priority !== routineDefaults.priority) {
       result.push({ key: "priority", label: "the priority" });
@@ -385,7 +412,7 @@ export function RoutineDetail() {
 
   const saveRoutine = useMutation({
     mutationFn: () => {
-      const payload = buildRoutineMutationPayload(editDraft);
+      const payload = buildRoutineMutationPayload(editDraft, routine?.executionPolicy ?? null);
       const baseRevisionId = routine?.latestRevisionId ?? null;
       return routinesApi.update(routineId!, {
         ...payload,
@@ -660,6 +687,7 @@ export function RoutineDetail() {
         description: response.routine.description ?? "",
         projectId: response.routine.projectId ?? "",
         assigneeAgentId: response.routine.assigneeAgentId ?? "",
+        reviewerAgentId: routineReviewerAgentId(response.routine.executionPolicy),
         priority: response.routine.priority,
         concurrencyPolicy: response.routine.concurrencyPolicy,
         catchUpPolicy: response.routine.catchUpPolicy,
