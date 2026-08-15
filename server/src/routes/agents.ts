@@ -1,8 +1,16 @@
 import { Router, type NextFunction, type Request, type Response } from "express";
 import { generateKeyPairSync, randomUUID } from "node:crypto";
 import path from "node:path";
+import { z } from "zod";
 import type { Db } from "@paperclipai/db";
-import { agents as agentsTable, companies, heartbeatRuns, issues as issuesTable, projects as projectsTable } from "@paperclipai/db";
+import {
+  activityLog as activityLogTable,
+  agents as agentsTable,
+  companies,
+  heartbeatRuns,
+  issues as issuesTable,
+  projects as projectsTable,
+} from "@paperclipai/db";
 import { and, desc, eq, inArray, not, sql } from "drizzle-orm";
 import {
   agentSkillSyncSchema,
@@ -11,6 +19,7 @@ import {
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
   createAgentKeySchema,
   createAgentHireSchema,
+  createAgentInstructionsBundleSchema,
   createAgentSchema,
   deriveAgentUrlKey,
   isUuidLike,
@@ -150,6 +159,20 @@ import {
 } from "../services/change-consent-gate.js";
 
 const AGENT_SKILL_ASSIGNMENT_MODES = ["add", "remove", "replace"] as const;
+
+const agentCreateCompletionPayloadSchema = z.object({
+  version: z.literal(1),
+  instructionsBundle: createAgentInstructionsBundleSchema.nullable(),
+  desiredSkills: z.array(z.string()).nullable(),
+  grantedByUserId: z.string().nullable(),
+  actor: z.object({
+    actorType: z.enum(["agent", "user"]),
+    actorId: z.string(),
+    agentId: z.string().nullable(),
+    runId: z.string().nullable(),
+    agentApiKeyId: z.string().nullable(),
+  }).strict(),
+}).strict();
 
 function requireAgentSkillAssignmentMode(req: Request, _res: Response, next: NextFunction) {
   if (!AGENT_SKILL_ASSIGNMENT_MODES.includes(req.body?.mode)) {
@@ -1569,8 +1592,10 @@ export function agentRoutes(
     adapterType: string | null | undefined;
     adapterConfig: Record<string, unknown>;
     constraintAdapterConfig?: Record<string, unknown>;
+    targetDb?: Db;
   }): Promise<Record<string, unknown>> {
-    const normalizedAdapterConfig = await secretsSvc.normalizeAdapterConfigForPersistence(
+    const targetSecretsSvc = input.targetDb ? secretService(input.targetDb) : secretsSvc;
+    const normalizedAdapterConfig = await targetSecretsSvc.normalizeAdapterConfigForPersistence(
       input.companyId,
       input.adapterConfig,
       {
@@ -1592,6 +1617,7 @@ export function agentRoutes(
     adapterType: string,
     runtimeConfig: Record<string, unknown>,
     baseAdapterConfig: Record<string, unknown>,
+    targetDb?: Db,
   ): Promise<Record<string, unknown>> {
     const entries = listRuntimeModelProfileAdapterConfigs(runtimeConfig);
     if (entries.length === 0) return runtimeConfig;
@@ -1613,6 +1639,7 @@ export function agentRoutes(
           ...baseAdapterConfig,
           ...adapterDefaultConfig,
         },
+        targetDb,
       });
       normalizedModelProfiles[entry.profileKey] = {
         ...entry.profile,
@@ -1994,8 +2021,9 @@ export function agentRoutes(
     adapterConfig: Record<string, unknown>,
     requestedDesiredSkills: AgentDesiredSkillEntry[] | undefined,
     mode: AgentSkillAssignmentMode,
-    options: { tolerateUnknownDesiredSkills?: boolean } = {},
+    options: { tolerateUnknownDesiredSkills?: boolean; targetDb?: Db } = {},
   ) {
+    const targetCompanySkills = options.targetDb ? companySkillService(options.targetDb) : companySkills;
     if (!requestedDesiredSkills) {
       return {
         adapterConfig,
@@ -2013,7 +2041,7 @@ export function agentRoutes(
     }
 
     const { resolved: resolvedRequestedSkillEntries, unresolved: unresolvedDesiredSkillKeys } =
-      await companySkills.resolveRequestedSkillEntries(companyId, requestedDesiredSkills, {
+      await targetCompanySkills.resolveRequestedSkillEntries(companyId, requestedDesiredSkills, {
         tolerateUnknownReferences: options.tolerateUnknownDesiredSkills,
       });
     const requestedSkillEntries = [
@@ -2026,7 +2054,7 @@ export function agentRoutes(
     const currentPreference = readPaperclipSkillSyncPreference(adapterConfig);
     const { resolved: resolvedCurrentSkillEntries, unresolved: unresolvedCurrentSkillKeys } =
       currentPreference.desiredSkillEntries.length > 0
-        ? await companySkills.resolveRequestedSkillEntries(
+        ? await targetCompanySkills.resolveRequestedSkillEntries(
           companyId,
           currentPreference.desiredSkillEntries,
           { tolerateUnknownReferences: true },
@@ -2048,7 +2076,7 @@ export function agentRoutes(
     // Runtime materialization + version selection only ever consider final
     // assignments that resolve to the company library; stale keys remain
     // persisted and explicitly removable without reaching adapter runtimes.
-    const runtimeSkillEntries = await companySkills.listRuntimeSkillEntries(companyId, {
+    const runtimeSkillEntries = await targetCompanySkills.listRuntimeSkillEntries(companyId, {
       materializeMissing: shouldMaterializeRuntimeSkillsForAdapter(adapterType),
       versionSelections: skillVersionSelectionMap(
         desiredSkillEntries.filter((entry) => resolvedKeys.has(entry.key)),
@@ -3170,106 +3198,166 @@ export function agentRoutes(
     }
 
     const {
+      idempotencyKey,
       desiredSkills: requestedDesiredSkills,
       instructionsBundle,
       ...createInput
     } = req.body;
     createInput.adapterType = assertSelectableAdapterType(createInput.adapterType);
-    const rawCreateAdapterConfig = (createInput.adapterConfig ?? {}) as Record<string, unknown>;
-    assertNoNewAgentLegacyPromptTemplate(
-      createInput.adapterType,
-      rawCreateAdapterConfig,
-    );
-    assertNoAgentAdapterConfigMutation(req, rawCreateAdapterConfig);
-    assertNoAgentRuntimeConfigAdapterConfigMutation(req, createInput.runtimeConfig);
-    const agentId = randomUUID();
-    const requestedAdapterConfig = applyCodexLocalKeyIsolation(
-      companyId,
-      agentId,
-      createInput.adapterType,
-      applyCreateDefaultsByAdapterType(
+    const actor = getActorInfo(req);
+    const grantedByUserId = req.actor.type === "board" ? (req.actor.userId ?? null) : null;
+    const createAgent = async (createDb: Db) => {
+      const rawCreateAdapterConfig = (createInput.adapterConfig ?? {}) as Record<string, unknown>;
+      assertNoNewAgentLegacyPromptTemplate(
         createInput.adapterType,
         rawCreateAdapterConfig,
-      ),
-    );
-    const desiredSkillAssignment = await resolveDesiredSkillAssignment(
-      companyId,
-      createInput.adapterType,
-      requestedAdapterConfig,
-      normalizeDesiredSkillSelections(Array.isArray(requestedDesiredSkills) ? requestedDesiredSkills : undefined),
-      "add",
-    );
-    const normalizedAdapterConfig = await normalizeMediatedAdapterConfigForPersistence({
-      companyId,
-      adapterType: createInput.adapterType,
-      adapterConfig: desiredSkillAssignment.adapterConfig,
-    });
-    const normalizedRuntimeConfig = await normalizeRuntimeConfigAdapterConfigsForPersistence(
-      companyId,
-      createInput.adapterType,
-      await normalizeNewAgentRuntimeConfig(createInput.adapterType, createInput.runtimeConfig),
-      normalizedAdapterConfig,
-    );
-    await assertAgentEnvironmentSelection(companyId, createInput.adapterType, createInput.defaultEnvironmentId);
-    await assertAgentDefaultEnvironmentSelection(companyId, createInput.defaultEnvironmentId, {
-      allowedDrivers: allowedEnvironmentDriversForAgent(createInput.adapterType),
-      allowedSandboxProviders: allowedSandboxProvidersForAgent(createInput.adapterType),
-    });
-
-    const createdAgent = await svc.create(companyId, {
-      id: agentId,
-      ...createInput,
-      adapterConfig: normalizedAdapterConfig,
-      runtimeConfig: normalizedRuntimeConfig,
-      status: "idle",
-      spentMonthlyCents: 0,
-      lastHeartbeatAt: null,
-    });
-    const agent = await materializeDefaultInstructionsBundleForNewAgent(createdAgent, instructionsBundle);
-
-    const actor = getActorInfo(req);
-    await logActivity(db, {
-      companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      runId: actor.runId,
-      agentApiKeyId: actor.agentApiKeyId,
-      action: "agent.created",
-      entityType: "agent",
-      entityId: agent.id,
-      details: {
-        name: agent.name,
-        role: agent.role,
-        desiredSkills: desiredSkillAssignment.desiredSkills,
-      },
-    });
-    const telemetryClient = getTelemetryClient();
-    if (telemetryClient) {
-      trackAgentCreated(telemetryClient, { agentRole: agent.role, agentId: agent.id });
-    }
-
-    await applyDefaultAgentTaskAssignGrant(
-      companyId,
-      agent.id,
-      req.actor.type === "board" ? (req.actor.userId ?? null) : null,
-    );
-    await builtInAgentService(db).ensureCompanyDefaultAgentGrants(companyId);
-
-    if (agent.budgetMonthlyCents > 0) {
-      await budgets.upsertPolicy(
-        companyId,
-        {
-          scopeType: "agent",
-          scopeId: agent.id,
-          amount: agent.budgetMonthlyCents,
-          windowKind: "calendar_month_utc",
-        },
-        actor.actorType === "user" ? actor.actorId : null,
       );
-    }
+      assertNoAgentAdapterConfigMutation(req, rawCreateAdapterConfig);
+      assertNoAgentRuntimeConfigAdapterConfigMutation(req, createInput.runtimeConfig);
+      const agentId = randomUUID();
+      const requestedAdapterConfig = applyCodexLocalKeyIsolation(
+        companyId,
+        agentId,
+        createInput.adapterType,
+        applyCreateDefaultsByAdapterType(
+          createInput.adapterType,
+          rawCreateAdapterConfig,
+        ),
+      );
+      const desiredSkillAssignment = await resolveDesiredSkillAssignment(
+        companyId,
+        createInput.adapterType,
+        requestedAdapterConfig,
+        normalizeDesiredSkillSelections(Array.isArray(requestedDesiredSkills) ? requestedDesiredSkills : undefined),
+        "add",
+        { targetDb: createDb },
+      );
+      const normalizedAdapterConfig = await normalizeMediatedAdapterConfigForPersistence({
+        companyId,
+        adapterType: createInput.adapterType,
+        adapterConfig: desiredSkillAssignment.adapterConfig,
+        targetDb: createDb,
+      });
+      const normalizedRuntimeConfig = await normalizeRuntimeConfigAdapterConfigsForPersistence(
+        companyId,
+        createInput.adapterType,
+        await normalizeNewAgentRuntimeConfig(createInput.adapterType, createInput.runtimeConfig),
+        normalizedAdapterConfig,
+        createDb,
+      );
+      await assertAgentEnvironmentSelection(companyId, createInput.adapterType, createInput.defaultEnvironmentId);
+      await assertAgentDefaultEnvironmentSelection(companyId, createInput.defaultEnvironmentId, {
+        allowedDrivers: allowedEnvironmentDriversForAgent(createInput.adapterType),
+        allowedSandboxProviders: allowedSandboxProvidersForAgent(createInput.adapterType),
+      });
 
-    res.status(201).json(agent);
+      const agent = await agentService(createDb).create(companyId, {
+        id: agentId,
+        ...createInput,
+        adapterConfig: normalizedAdapterConfig,
+        runtimeConfig: normalizedRuntimeConfig,
+        status: "idle",
+        spentMonthlyCents: 0,
+        lastHeartbeatAt: null,
+      });
+      return {
+        agent,
+        completionPayload: agentCreateCompletionPayloadSchema.parse({
+          version: 1,
+          instructionsBundle: instructionsBundle ?? null,
+          desiredSkills: desiredSkillAssignment.desiredSkills,
+          grantedByUserId,
+          actor: {
+            actorType: actor.actorType,
+            actorId: actor.actorId,
+            agentId: actor.agentId,
+            runId: actor.runId,
+            agentApiKeyId: actor.agentApiKeyId,
+          },
+        }),
+      };
+    };
+
+    const createResult = idempotencyKey
+      ? await svc.createIdempotently(companyId, idempotencyKey, createAgent)
+      : { ...(await createAgent(db)), replayed: false, completed: false };
+
+    const completeAgentCreate = async (
+      createdAgent: typeof createResult.agent,
+      rawCompletionPayload: Record<string, unknown>,
+    ) => {
+      const completionPayload = agentCreateCompletionPayloadSchema.parse(rawCompletionPayload);
+      const agent = await materializeDefaultInstructionsBundleForNewAgent(
+        createdAgent,
+        completionPayload.instructionsBundle ?? undefined,
+      );
+
+      await applyDefaultAgentTaskAssignGrant(
+        companyId,
+        agent.id,
+        completionPayload.grantedByUserId,
+      );
+      await builtInAgentService(db).ensureCompanyDefaultAgentGrants(companyId);
+
+      if (agent.budgetMonthlyCents > 0) {
+        await budgets.upsertPolicy(
+          companyId,
+          {
+            scopeType: "agent",
+            scopeId: agent.id,
+            amount: agent.budgetMonthlyCents,
+            windowKind: "calendar_month_utc",
+          },
+          completionPayload.actor.actorType === "user" ? completionPayload.actor.actorId : null,
+        );
+      }
+
+      const activityExists = idempotencyKey
+        ? await db
+          .select({ id: activityLogTable.id })
+          .from(activityLogTable)
+          .where(and(
+            eq(activityLogTable.companyId, companyId),
+            eq(activityLogTable.action, "agent.created"),
+            eq(activityLogTable.entityType, "agent"),
+            eq(activityLogTable.entityId, agent.id),
+          ))
+          .limit(1)
+          .then((rows) => rows.length > 0)
+        : false;
+      if (!activityExists) {
+        await logActivity(db, {
+          companyId,
+          actorType: completionPayload.actor.actorType,
+          actorId: completionPayload.actor.actorId,
+          agentId: completionPayload.actor.agentId,
+          runId: completionPayload.actor.runId,
+          agentApiKeyId: completionPayload.actor.agentApiKeyId,
+          action: "agent.created",
+          entityType: "agent",
+          entityId: agent.id,
+          details: {
+            name: agent.name,
+            role: agent.role,
+            desiredSkills: completionPayload.desiredSkills,
+          },
+        });
+        const telemetryClient = getTelemetryClient();
+        if (telemetryClient) {
+          try {
+            trackAgentCreated(telemetryClient, { agentRole: agent.role, agentId: agent.id });
+          } catch (error) {
+            logger.warn({ error, agentId: agent.id }, "Failed to emit agent-created telemetry");
+          }
+        }
+      }
+      return agent;
+    };
+
+    const agent = idempotencyKey
+      ? (await svc.completeCreateIdempotently(companyId, idempotencyKey, completeAgentCreate)).agent
+      : await completeAgentCreate(createResult.agent, createResult.completionPayload);
+    res.status(createResult.replayed ? 200 : 201).json(agent);
   });
 
   router.patch("/agents/:id/permissions", validate(updateAgentPermissionsSchema), async (req, res) => {

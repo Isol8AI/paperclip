@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { AGENT_ROLE_LABELS, acceptInviteSchema, createAgentSchema, updateAgentSchema } from "./index.js";
+import {
+  AGENT_ROLE_LABELS,
+  acceptInviteSchema,
+  createAgentHireSchema,
+  createAgentSchema,
+  updateAgentSchema,
+} from "./index.js";
 
 describe("dynamic adapter type validation schemas", () => {
   it("accepts external adapter types in create/update agent schemas", () => {
@@ -38,6 +44,23 @@ describe("dynamic adapter type validation schemas", () => {
         },
       }).instructionsBundle?.files["AGENTS.md"],
     ).toBe("Use AGENTS.md.");
+  });
+
+  it("limits create idempotency keys to the direct-create contract", () => {
+    expect(
+      createAgentSchema.parse({
+        name: "Idempotent Agent",
+        adapterType: "process",
+        idempotencyKey: "hire:agent:v1",
+      }).idempotencyKey,
+    ).toBe("hire:agent:v1");
+
+    expect(() => createAgentHireSchema.parse({
+      name: "Pending Agent",
+      adapterType: "process",
+      idempotencyKey: "unsupported:hire",
+    })).toThrow();
+    expect(() => updateAgentSchema.parse({ idempotencyKey: "unsupported:patch" })).toThrow();
   });
 
   it("accepts external adapter types in invite acceptance schema", () => {

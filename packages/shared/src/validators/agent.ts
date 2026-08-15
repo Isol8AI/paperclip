@@ -68,7 +68,7 @@ export const agentRuntimeConfigSchema = z.object({
   }).strict().optional(),
 }).catchall(z.unknown());
 
-export const createAgentSchema = z.object({
+const createAgentInputSchema = z.object({
   name: z.string().min(1),
   role: z.enum(AGENT_ROLES).optional().default("general"),
   title: z.string().optional().nullable(),
@@ -84,6 +84,10 @@ export const createAgentSchema = z.object({
   budgetMonthlyCents: z.number().int().nonnegative().optional().default(0),
   permissions: agentPermissionsSchema.optional(),
   metadata: z.record(z.string(), z.unknown()).optional().nullable(),
+});
+
+export const createAgentSchema = createAgentInputSchema.extend({
+  idempotencyKey: z.string().trim().min(1).max(255).optional(),
 });
 
 export type CreateAgent = z.infer<typeof createAgentSchema>;
@@ -106,17 +110,19 @@ export const builtInAgentResetSchema = z.object({
 
 export type BuiltInAgentReset = z.infer<typeof builtInAgentResetSchema>;
 
-export const createAgentHireSchema = createAgentSchema.extend({
+export const createAgentHireSchema = createAgentInputSchema.extend({
+  idempotencyKey: z.never().optional(),
   sourceIssueId: z.string().uuid().optional().nullable(),
   sourceIssueIds: z.array(z.string().uuid()).optional(),
 });
 
 export type CreateAgentHire = z.infer<typeof createAgentHireSchema>;
 
-export const updateAgentSchema = createAgentSchema
+export const updateAgentSchema = createAgentInputSchema
   .omit({ permissions: true })
   .partial()
   .extend({
+    idempotencyKey: z.never().optional(),
     permissions: z.never().optional(),
     replaceAdapterConfig: z.boolean().optional(),
     status: z.enum(AGENT_STATUSES).optional(),
