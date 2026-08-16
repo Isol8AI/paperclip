@@ -19,6 +19,7 @@ All environment variables that Paperclip uses for server configuration.
 | `PAPERCLIP_DEPLOYMENT_MODE` | `local_trusted` | Runtime mode override |
 | `PAPERCLIP_DEPLOYMENT_EXPOSURE` | `private` | Exposure policy when deployment mode is `authenticated` |
 | `PAPERCLIP_API_URL` | (auto-derived) | Paperclip API base URL. When set externally (e.g., via Kubernetes ConfigMap, load balancer, or reverse proxy), the server preserves the value instead of deriving it from the listen host and port. Useful for deployments where the public-facing URL differs from the local bind address. |
+| `PAPERCLIP_REQUIRE_GOVERNED_AGENT_CREATION` | `false` | Require agent creation to come through `POST /api/companies/:companyId/agents` with an `Idempotency-Key`, reject agent-authenticated and native hire requests, and require hire approvals to reference a pre-created pending agent. Intended for deployments where an external control plane owns agent limits and provisioning. |
 
 ## Secrets
 

@@ -39,6 +39,7 @@ describeEmbeddedPostgres("pending approval agent config integrity", () => {
   }, 20_000);
 
   afterEach(async () => {
+    delete process.env.PAPERCLIP_REQUIRE_GOVERNED_AGENT_CREATION;
     await db.delete(activityLog);
     await db.delete(budgetPolicies);
     await db.delete(approvals);
@@ -154,5 +155,85 @@ describeEmbeddedPostgres("pending approval agent config integrity", () => {
       budgetMonthlyCents: 1234,
       metadata: { source: "hire-form" },
     });
+  });
+
+  it("allows only pre-created pending agents through governed hire approvals", async () => {
+    process.env.PAPERCLIP_REQUIRE_GOVERNED_AGENT_CREATION = "true";
+    const companyId = await seedCompany();
+    const agentSvc = agentService(db);
+    const approvalSvc = approvalService(db);
+    const input = {
+      name: "Governed Hire",
+      role: "engineer",
+      adapterType: "process",
+      adapterConfig: {},
+      status: "pending_approval" as const,
+      spentMonthlyCents: 0,
+      lastHeartbeatAt: null,
+    };
+
+    await expect(agentSvc.create(companyId, input)).rejects.toMatchObject({
+      status: 409,
+      details: { code: "governed_agent_creation_required" },
+    });
+
+    const pending = await agentSvc.create(companyId, input, { governedCreationRequest: true });
+    await expect(approvalSvc.create(companyId, {
+      type: "hire_agent",
+      requestedByAgentId: null,
+      requestedByUserId: "board-user",
+      status: "pending",
+      payload: { name: "Missing pre-created agent" },
+      decisionNote: null,
+      decidedByUserId: null,
+      decidedAt: null,
+      updatedAt: new Date(),
+    })).rejects.toMatchObject({
+      status: 422,
+      details: { code: "governed_agent_creation_required" },
+    });
+
+    const approval = await approvalSvc.create(companyId, {
+      type: "hire_agent",
+      requestedByAgentId: null,
+      requestedByUserId: "board-user",
+      status: "pending",
+      payload: { name: pending.name, agentId: pending.id },
+      decisionNote: null,
+      decidedByUserId: null,
+      decidedAt: null,
+      updatedAt: new Date(),
+    });
+    await approvalSvc.approve(approval.id, "board-user", "Approved");
+    const replay = await approvalSvc.approve(approval.id, "board-user", "Approved again");
+
+    await expect(agentSvc.getById(pending.id)).resolves.toMatchObject({ status: "idle" });
+    expect(replay.applied).toBe(false);
+  });
+
+  it("keeps a legacy minting hire approval pending when governed creation is enabled", async () => {
+    const companyId = await seedCompany();
+    const [legacy] = await db.insert(approvals).values({
+      companyId,
+      type: "hire_agent",
+      requestedByAgentId: null,
+      requestedByUserId: "board-user",
+      status: "pending",
+      payload: { name: "Legacy mint-on-approve" },
+      decisionNote: null,
+      decidedByUserId: null,
+      decidedAt: null,
+      updatedAt: new Date(),
+    }).returning();
+    process.env.PAPERCLIP_REQUIRE_GOVERNED_AGENT_CREATION = "true";
+
+    await expect(approvalService(db).approve(legacy!.id, "board-user", "Approved"))
+      .rejects.toMatchObject({
+        status: 422,
+        details: { code: "governed_agent_creation_required" },
+      });
+    const [stored] = await db.select().from(approvals).where(eq(approvals.id, legacy!.id));
+    expect(stored?.status).toBe("pending");
+    expect(await db.select().from(agents).where(eq(agents.companyId, companyId))).toHaveLength(0);
   });
 });

@@ -4,6 +4,7 @@ import { approvalComments, approvals } from "@paperclipai/db";
 import { notFound, unprocessable } from "../errors.js";
 import { redactCurrentUserText } from "../log-redaction.js";
 import { agentService } from "./agents.js";
+import { governedAgentCreationRequired } from "./agent-creation-policy.js";
 import { budgetService } from "./budgets.js";
 import { notifyHireApproved } from "./hire-hook.js";
 import { instanceSettingsService } from "./instance-settings.js";
@@ -39,6 +40,28 @@ export function approvalService(db: Db) {
       .then((rows) => rows[0] ?? null);
     if (!existing) throw notFound("Approval not found");
     return existing;
+  }
+
+  async function assertGovernedHireApproval(
+    companyId: string,
+    type: string,
+    payload: Record<string, unknown>,
+  ) {
+    if (!governedAgentCreationRequired() || type !== "hire_agent") return;
+    const agentId = typeof payload.agentId === "string" ? payload.agentId.trim() : "";
+    if (!agentId) {
+      throw unprocessable(
+        "Governed hire approvals require payload.agentId for a pre-created agent.",
+        { code: "governed_agent_creation_required" },
+      );
+    }
+    const agent = await agentsSvc.getById(agentId);
+    if (!agent || agent.companyId !== companyId || agent.status !== "pending_approval") {
+      throw unprocessable(
+        "Governed hire approvals require a pending pre-created agent in the same company.",
+        { code: "governed_agent_creation_required", agentId },
+      );
+    }
   }
 
   async function resolveApproval(
@@ -114,12 +137,14 @@ export function approvalService(db: Db) {
       return rows[0] ?? null;
     },
 
-    create: (companyId: string, data: Omit<typeof approvals.$inferInsert, "companyId">) =>
-      db
+    create: async (companyId: string, data: Omit<typeof approvals.$inferInsert, "companyId">) => {
+      await assertGovernedHireApproval(companyId, data.type, data.payload as Record<string, unknown>);
+      return db
         .insert(approvals)
         .values({ ...data, companyId })
         .returning()
-        .then((rows) => rows[0]),
+        .then((rows) => rows[0]);
+    },
 
     // Cancel an open (pending/revision_requested) approval without a board
     // decision — e.g. when its paired agent is terminated during duplicate
@@ -141,6 +166,16 @@ export function approvalService(db: Db) {
     },
 
     approve: async (id: string, decidedByUserId: string, decisionNote?: string | null) => {
+      if (governedAgentCreationRequired()) {
+        const existing = await getExistingApproval(id);
+        if (canResolveStatuses.has(existing.status)) {
+          await assertGovernedHireApproval(
+            existing.companyId,
+            existing.type,
+            existing.payload as Record<string, unknown>,
+          );
+        }
+      }
       const { approval: updated, applied } = await resolveApproval(
         id,
         "approved",
@@ -255,6 +290,12 @@ export function approvalService(db: Db) {
       if (existing.status !== "revision_requested") {
         throw unprocessable("Only revision requested approvals can be resubmitted");
       }
+
+      await assertGovernedHireApproval(
+        existing.companyId,
+        existing.type,
+        payload ?? (existing.payload as Record<string, unknown>),
+      );
 
       const now = new Date();
       return db

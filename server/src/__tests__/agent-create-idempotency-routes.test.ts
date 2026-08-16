@@ -42,6 +42,7 @@ describeEmbeddedPostgres("agent create idempotency routes", () => {
   }, 20_000);
 
   afterEach(async () => {
+    delete process.env.PAPERCLIP_REQUIRE_GOVERNED_AGENT_CREATION;
     await db.execute(sql.raw(
       "ALTER TABLE activity_log DROP CONSTRAINT IF EXISTS reject_agent_created_for_recovery_test",
     ));
@@ -317,5 +318,25 @@ describeEmbeddedPostgres("agent create idempotency routes", () => {
       .send(agentBody())
       .expect(422);
     expect(await db.select().from(agents)).toHaveLength(0);
+  });
+
+  it("requires an idempotency key for board creation when governed creation is enabled", async () => {
+    process.env.PAPERCLIP_REQUIRE_GOVERNED_AGENT_CREATION = "true";
+    const company = await seedCompany();
+    await db.update(companies)
+      .set({ requireBoardApprovalForNewAgents: true })
+      .where(eq(companies.id, company.id));
+    const app = createApp();
+    const path = `/api/companies/${company.id}/agents`;
+
+    const missingKey = await request(app).post(path).send(agentBody()).expect(409);
+    expect(missingKey.body.code).toBe("governed_agent_creation_required");
+
+    await request(app)
+      .post(path)
+      .set("Idempotency-Key", "governed:forge:v1")
+      .send(agentBody())
+      .expect(201);
+    expect(await db.select().from(agents).where(eq(agents.companyId, company.id))).toHaveLength(1);
   });
 });

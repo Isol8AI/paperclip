@@ -280,6 +280,7 @@ async function requestApp(
 
 describe.sequential("agent permission routes", () => {
   beforeEach(() => {
+    delete process.env.PAPERCLIP_REQUIRE_GOVERNED_AGENT_CREATION;
     vi.resetModules();
     vi.doUnmock("@paperclipai/shared/telemetry");
     vi.doUnmock("../telemetry.js");
@@ -837,6 +838,61 @@ describe.sequential("agent permission routes", () => {
     expect(mockAgentService.create).not.toHaveBeenCalled();
     expect(mockLogActivity).not.toHaveBeenCalled();
   });
+
+  it("blocks agent-authenticated direct creates even with permission and an idempotency key in governed mode", async () => {
+    process.env.PAPERCLIP_REQUIRE_GOVERNED_AGENT_CREATION = "true";
+    mockAccessService.hasPermission.mockResolvedValue(true);
+
+    const app = await createApp(
+      {
+        type: "agent",
+        agentId,
+        companyId,
+        source: "agent_key",
+        runId: "run-1",
+      },
+      { requireBoardApprovalForNewAgents: true },
+    );
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl)
+      .post(`/api/companies/${companyId}/agents`)
+      .set("Idempotency-Key", "agent-bypass:v1")
+      .send({
+        name: "Backdoor",
+        role: "engineer",
+        adapterType: "process",
+        adapterConfig: {},
+      }));
+
+    expect(res.status).toBe(403);
+    expect(res.body.code).toBe("governed_agent_creation_required");
+    expect(mockAgentService.create).not.toHaveBeenCalled();
+  }, 15_000);
+
+  it("blocks the native agent-hire route in governed mode", async () => {
+    process.env.PAPERCLIP_REQUIRE_GOVERNED_AGENT_CREATION = "true";
+
+    const app = await createApp({
+      type: "board",
+      userId: "board-user",
+      source: "local_implicit",
+      isInstanceAdmin: true,
+      companyIds: [companyId],
+    });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl)
+      .post(`/api/companies/${companyId}/agent-hires`)
+      .send({
+        name: "Backdoor",
+        role: "engineer",
+        adapterType: "process",
+        adapterConfig: {},
+      }));
+
+    expect(res.status).toBe(409);
+    expect(res.body.code).toBe("governed_agent_creation_required");
+    expect(mockAgentService.create).not.toHaveBeenCalled();
+  }, 15_000);
 
   it("allows direct agent creation for authenticated board users with agent create permission when approval is not required", async () => {
     mockAccessService.canUser.mockResolvedValue(true);

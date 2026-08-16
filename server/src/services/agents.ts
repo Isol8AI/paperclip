@@ -37,6 +37,7 @@ import {
   readBuiltInAgentMarker,
 } from "./built-in-agent-metadata.js";
 import { issueThreadInteractionService } from "./issue-thread-interactions.js";
+import { governedAgentCreationRequired } from "./agent-creation-policy.js";
 
 function hashToken(token: string) {
   return createHash("sha256").update(token).digest("hex");
@@ -79,6 +80,15 @@ interface UpdateAgentOptions {
 
 interface CreateAgentOptions {
   allowBuiltInAgentMetadata?: boolean;
+  governedCreationRequest?: boolean;
+}
+
+function assertAgentCreationPolicy(options?: CreateAgentOptions) {
+  if (!governedAgentCreationRequired() || options?.governedCreationRequest === true) return;
+  throw conflict(
+    "This deployment requires agent creation through its governed provisioning API.",
+    { code: "governed_agent_creation_required" },
+  );
 }
 
 interface AgentShortnameRow {
@@ -705,6 +715,7 @@ export function agentService(db: Db) {
     },
 
     create: async (companyId: string, data: Omit<typeof agents.$inferInsert, "companyId">, options?: CreateAgentOptions) => {
+      assertAgentCreationPolicy(options);
       assertBuiltInAgentMetadataMutationAllowed(null, data.metadata, options);
       if (data.reportsTo) {
         await ensureManager(companyId, data.reportsTo);
