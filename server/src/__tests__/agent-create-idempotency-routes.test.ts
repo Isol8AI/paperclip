@@ -332,11 +332,20 @@ describeEmbeddedPostgres("agent create idempotency routes", () => {
     const missingKey = await request(app).post(path).send(agentBody()).expect(409);
     expect(missingKey.body.code).toBe("governed_agent_creation_required");
 
-    await request(app)
+    const created = await request(app)
       .post(path)
       .set("Idempotency-Key", "governed:forge:v1")
       .send(agentBody())
       .expect(201);
+    const replay = await request(app)
+      .post(path)
+      .set("Idempotency-Key", "governed:forge:v1")
+      .set("Idempotency-Replay-Only", "true")
+      .send({ ...agentBody(), name: "Replay must not mint" })
+      .expect(200);
+
+    expect(replay.body.id).toBe(created.body.id);
+    expect(replay.body.name).toBe("Forge");
     expect(await db.select().from(agents).where(eq(agents.companyId, company.id))).toHaveLength(1);
   });
 });

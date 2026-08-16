@@ -236,4 +236,65 @@ describeEmbeddedPostgres("pending approval agent config integrity", () => {
     expect(stored?.status).toBe("pending");
     expect(await db.select().from(agents).where(eq(agents.companyId, companyId))).toHaveLength(0);
   });
+
+  it("rejects legacy hire resubmission before mutating the approval or minting an agent", async () => {
+    const companyId = await seedCompany();
+    const [legacy] = await db.insert(approvals).values({
+      companyId,
+      type: "hire_agent",
+      requestedByAgentId: null,
+      requestedByUserId: "board-user",
+      status: "revision_requested",
+      payload: { name: "Legacy mint-on-resubmit" },
+      decisionNote: "Needs a governed agent reference",
+      decidedByUserId: "board-user",
+      decidedAt: new Date(),
+      updatedAt: new Date(),
+    }).returning();
+    process.env.PAPERCLIP_REQUIRE_GOVERNED_AGENT_CREATION = "true";
+
+    await expect(approvalService(db).resubmit(legacy!.id, {
+      name: "Still missing the pre-created agent",
+    })).rejects.toMatchObject({
+      status: 422,
+      details: { code: "governed_agent_creation_required" },
+    });
+    const [stored] = await db.select().from(approvals).where(eq(approvals.id, legacy!.id));
+    expect(stored?.status).toBe("revision_requested");
+    expect(await db.select().from(agents).where(eq(agents.companyId, companyId))).toHaveLength(0);
+  });
+
+  it("rejects and replays a governed pre-created hire without reapplying termination", async () => {
+    process.env.PAPERCLIP_REQUIRE_GOVERNED_AGENT_CREATION = "true";
+    const companyId = await seedCompany();
+    const agentSvc = agentService(db);
+    const approvalSvc = approvalService(db);
+    const pending = await agentSvc.create(companyId, {
+      name: "Rejected Governed Hire",
+      role: "engineer",
+      adapterType: "process",
+      adapterConfig: {},
+      status: "pending_approval",
+      spentMonthlyCents: 0,
+      lastHeartbeatAt: null,
+    }, { governedCreationRequest: true });
+    const approval = await approvalSvc.create(companyId, {
+      type: "hire_agent",
+      requestedByAgentId: null,
+      requestedByUserId: "board-user",
+      status: "pending",
+      payload: { name: pending.name, agentId: pending.id },
+      decisionNote: null,
+      decidedByUserId: null,
+      decidedAt: null,
+      updatedAt: new Date(),
+    });
+
+    const first = await approvalSvc.reject(approval.id, "board-user", "Rejected");
+    const replay = await approvalSvc.reject(approval.id, "board-user", "Rejected again");
+
+    expect(first.applied).toBe(true);
+    expect(replay.applied).toBe(false);
+    await expect(agentSvc.getById(pending.id)).resolves.toMatchObject({ status: "terminated" });
+  });
 });
