@@ -1852,6 +1852,55 @@ describeEmbeddedPostgres("authorization service", () => {
     });
   });
 
+  it("denies agent principals agents:create when governed agent creation is required", async () => {
+    process.env.PAPERCLIP_REQUIRE_GOVERNED_AGENT_CREATION = "true";
+    try {
+      const company = await createCompany(db, "Governed");
+      // The only two ways an agent otherwise reaches agents:create — legacy
+      // CEO authority, and an explicit principal grant.
+      const ceo = await createAgent(db, company.id, { role: "ceo" });
+      const granted = await createAgent(db, company.id, { role: "engineer" });
+      await grantAgentPermission(db, company.id, granted.id, "agents:create");
+
+      for (const actorAgent of [ceo, granted]) {
+        const decision = await authorizationService(db).decide({
+          actor: {
+            type: "agent",
+            agentId: actorAgent.id,
+            companyId: company.id,
+            source: "agent_key",
+          },
+          action: "agents:create",
+          resource: { type: "company", companyId: company.id },
+        });
+        expect(decision).toMatchObject({
+          allowed: false,
+          reason: "deny_policy_restricted",
+        });
+      }
+    } finally {
+      delete process.env.PAPERCLIP_REQUIRE_GOVERNED_AGENT_CREATION;
+    }
+  });
+
+  it("still allows board users agents:create when governed agent creation is required", async () => {
+    process.env.PAPERCLIP_REQUIRE_GOVERNED_AGENT_CREATION = "true";
+    try {
+      const company = await createCompany(db, "GovernedBoard");
+      const userId = await createUser(db);
+      await grantUserPermission(db, company.id, userId, "agents:create");
+
+      const decision = await authorizationService(db).decide({
+        actor: { type: "board", userId, source: "session", companyIds: [company.id] },
+        action: "agents:create",
+        resource: { type: "company", companyId: company.id },
+      });
+      expect(decision.allowed).toBe(true);
+    } finally {
+      delete process.env.PAPERCLIP_REQUIRE_GOVERNED_AGENT_CREATION;
+    }
+  });
+
   it("denies active-checkout management outside the CEO caller company scope", async () => {
     const sourceCompany = await createCompany(db, "CheckoutSource");
     const targetCompany = await createCompany(db, "CheckoutTarget");

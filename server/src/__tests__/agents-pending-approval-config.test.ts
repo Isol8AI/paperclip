@@ -172,12 +172,7 @@ describeEmbeddedPostgres("pending approval agent config integrity", () => {
       lastHeartbeatAt: null,
     };
 
-    await expect(agentSvc.create(companyId, input)).rejects.toMatchObject({
-      status: 409,
-      details: { code: "governed_agent_creation_required" },
-    });
-
-    const pending = await agentSvc.create(companyId, input, { governedCreationRequest: true });
+    const pending = await agentSvc.create(companyId, input);
     await expect(approvalSvc.create(companyId, {
       type: "hire_agent",
       requestedByAgentId: null,
@@ -277,7 +272,7 @@ describeEmbeddedPostgres("pending approval agent config integrity", () => {
       status: "pending_approval",
       spentMonthlyCents: 0,
       lastHeartbeatAt: null,
-    }, { governedCreationRequest: true });
+    });
     const approval = await approvalSvc.create(companyId, {
       type: "hire_agent",
       requestedByAgentId: null,

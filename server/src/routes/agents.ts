@@ -65,7 +65,6 @@ import {
   syncInstructionsBundleConfigFromFilePath,
   workspaceOperationService,
 } from "../services/index.js";
-import { governedAgentCreationRequired } from "../services/agent-creation-policy.js";
 import { badRequest, conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
 import { createRunSecretRedactionRegistry } from "../services/run-secret-redaction.js";
 import { assertBoard, assertCompanyAccess, assertInstanceAdmin, buildActorSecretContext, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
@@ -2999,12 +2998,6 @@ export function agentRoutes(
   router.post("/companies/:companyId/agent-hires", validate(createAgentHireSchema), async (req, res) => {
     const companyId = req.params.companyId as string;
     await assertCanCreateAgentsForCompany(req, companyId);
-    if (governedAgentCreationRequired()) {
-      throw conflict(
-        "This deployment requires hires to use a pre-created agent and a governed approval.",
-        { code: "governed_agent_creation_required" },
-      );
-    }
     const sourceIssueIds = parseSourceIssueIds(req.body);
     const {
       desiredSkills: requestedDesiredSkills,
@@ -3189,6 +3182,21 @@ export function agentRoutes(
     const companyId = req.params.companyId as string;
     await assertCanCreateAgentsForCompany(req, companyId);
 
+    const company = await db
+      .select()
+      .from(companies)
+      .where(eq(companies.id, companyId))
+      .then((rows) => rows[0] ?? null);
+    if (!company) {
+      res.status(404).json({ error: "Company not found" });
+      return;
+    }
+    if (company.requireBoardApprovalForNewAgents) {
+      throw conflict(
+        "Direct agent creation requires board approval. Use POST /api/companies/:companyId/agent-hires to create a pending hire approval.",
+      );
+    }
+
     const rawIdempotencyKey = req.header("Idempotency-Key");
     const idempotencyKey = rawIdempotencyKey?.trim() || null;
     if (rawIdempotencyKey !== undefined && (!idempotencyKey || idempotencyKey.length > 255)) {
@@ -3202,35 +3210,6 @@ export function agentRoutes(
     const idempotencyReplayOnly = normalizedReplayOnly === "true";
     if (idempotencyReplayOnly && !idempotencyKey) {
       throw unprocessable("Idempotency-Replay-Only requires Idempotency-Key");
-    }
-    const governedCreationEnabled = governedAgentCreationRequired();
-    if (governedCreationEnabled && req.actor.type === "agent") {
-      throw forbidden(
-        "Agent actors cannot create agents directly in this deployment.",
-        { code: "governed_agent_creation_required" },
-      );
-    }
-    if (governedCreationEnabled && !idempotencyKey) {
-      throw conflict(
-        "This deployment requires Idempotency-Key for governed agent creation.",
-        { code: "governed_agent_creation_required" },
-      );
-    }
-    const governedCreationRequest = governedCreationEnabled && idempotencyKey !== null;
-
-    const company = await db
-      .select()
-      .from(companies)
-      .where(eq(companies.id, companyId))
-      .then((rows) => rows[0] ?? null);
-    if (!company) {
-      res.status(404).json({ error: "Company not found" });
-      return;
-    }
-    if (company.requireBoardApprovalForNewAgents && !governedCreationRequest) {
-      throw conflict(
-        "Direct agent creation requires board approval. Use POST /api/companies/:companyId/agent-hires to create a pending hire approval.",
-      );
     }
 
     const {
@@ -3286,8 +3265,7 @@ export function agentRoutes(
         allowedSandboxProviders: allowedSandboxProvidersForAgent(createInput.adapterType),
       });
 
-      const createService = agentService(createDb);
-      const agentInput = {
+      const agent = await agentService(createDb).create(companyId, {
         id: agentId,
         ...createInput,
         adapterConfig: normalizedAdapterConfig,
@@ -3295,10 +3273,7 @@ export function agentRoutes(
         status: "idle",
         spentMonthlyCents: 0,
         lastHeartbeatAt: null,
-      };
-      const agent = governedCreationRequest
-        ? await createService.create(companyId, agentInput, { governedCreationRequest: true })
-        : await createService.create(companyId, agentInput);
+      });
       return {
         agent,
         completionPayload: agentCreateCompletionPayloadSchema.parse({

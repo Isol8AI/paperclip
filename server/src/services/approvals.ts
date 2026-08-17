@@ -42,13 +42,17 @@ export function approvalService(db: Db) {
     return existing;
   }
 
+  // A `hire_agent` approval without `payload.agentId` MINTS an agent when the
+  // board approves it — the second way an agent principal can grow the roster
+  // in a governed deployment, since filing an approval needs only company
+  // access. Requiring a pre-created pending agent turns approve into activate.
   async function assertGovernedHireApproval(
     companyId: string,
     type: string,
-    payload: Record<string, unknown>,
+    payload: Record<string, unknown> | null | undefined,
   ) {
     if (!governedAgentCreationRequired() || type !== "hire_agent") return;
-    const agentId = typeof payload.agentId === "string" ? payload.agentId.trim() : "";
+    const agentId = typeof payload?.agentId === "string" ? payload.agentId.trim() : "";
     if (!agentId) {
       throw unprocessable(
         "Governed hire approvals require payload.agentId for a pre-created agent.",
@@ -138,7 +142,7 @@ export function approvalService(db: Db) {
     },
 
     create: async (companyId: string, data: Omit<typeof approvals.$inferInsert, "companyId">) => {
-      await assertGovernedHireApproval(companyId, data.type, data.payload as Record<string, unknown>);
+      await assertGovernedHireApproval(companyId, data.type, data.payload as Record<string, unknown> | null);
       return db
         .insert(approvals)
         .values({ ...data, companyId })
