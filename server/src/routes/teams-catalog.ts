@@ -14,7 +14,6 @@ import {
   teamsCatalogService,
 } from "../services/teams-catalog.js";
 import { forbidden } from "../errors.js";
-import { governedAgentCreationRequired } from "../services/agent-creation-policy.js";
 import { assertAuthenticated, assertCompanyAccess, getActorInfo } from "./authz.js";
 
 export function teamsCatalogRoutes(db: Db) {
@@ -48,15 +47,6 @@ export function teamsCatalogRoutes(db: Db) {
 
     if (!req.actor.agentId) {
       throw forbidden("Agent authentication required");
-    }
-
-    // The one agent-reachable create path that does not run through
-    // accessService.decide, so the deployment fence is spelled out here too.
-    if (governedAgentCreationRequired()) {
-      throw forbidden(
-        "Agent principals cannot create agents in this deployment; its control plane owns the roster.",
-        { code: "governed_agent_creation_required" },
-      );
     }
 
     const actorAgent = await agents.getById(req.actor.agentId);

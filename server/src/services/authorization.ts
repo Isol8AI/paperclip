@@ -28,7 +28,6 @@ import {
   type TrustPresetResolution,
 } from "./trust-preset-resolver.js";
 import { logger } from "../middleware/logger.js";
-import { governedAgentCreationRequired } from "./agent-creation-policy.js";
 
 export type AuthorizationActor =
   {
@@ -1793,20 +1792,6 @@ export function authorizationService(db: Db) {
         action: input.action,
         reason: "deny_company_boundary",
         explanation: "Agent key cannot access another company.",
-      });
-    }
-
-    // Deployment fence for installations whose external control plane owns
-    // agent limits, artifacts, and runtime pairing: no agent principal may
-    // mint an agent, whatever grants or legacy CEO authority it carries.
-    // Decided here rather than per-route so every current and future
-    // `agents:create` caller inherits it from the one authorization seam.
-    if (input.action === "agents:create" && governedAgentCreationRequired()) {
-      return deny({
-        action: input.action,
-        reason: "deny_policy_restricted",
-        explanation:
-          "Agent principals cannot create agents in this deployment; its control plane owns the roster.",
       });
     }
 

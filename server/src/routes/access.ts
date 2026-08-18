@@ -56,7 +56,6 @@ import {
   badRequest,
   tooManyRequests
 } from "../errors.js";
-import { governedAgentCreationRequired } from "../services/agent-creation-policy.js";
 import {
   createInviteRateLimiter,
   type InviteRateLimiter,
@@ -4217,16 +4216,6 @@ export function accessRoutes(
           req.actor.userId ?? null
         );
       } else {
-        // Approving an agent-type join request MINTS an agent, and it is
-        // gated on joins:approve rather than agents:create — so an agent
-        // principal holding that grant would otherwise route around the
-        // deployment fence.
-        if (req.actor.type === "agent" && governedAgentCreationRequired()) {
-          throw forbidden(
-            "Agent principals cannot create agents in this deployment; its control plane owns the roster.",
-            { code: "governed_agent_creation_required" },
-          );
-        }
         const existingAgents = await agents.list(companyId);
         const managerId = resolveJoinRequestAgentManagerId(existingAgents);
         if (!managerId) {

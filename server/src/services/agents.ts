@@ -55,6 +55,7 @@ import {
   readBuiltInAgentMarker,
 } from "./built-in-agent-metadata.js";
 import { issueThreadInteractionService } from "./issue-thread-interactions.js";
+import { assertAgentCreationAllowed } from "./agent-creation-policy.js";
 
 function hashToken(token: string) {
   return createHash("sha256").update(token).digest("hex");
@@ -723,6 +724,7 @@ export function agentService(db: Db) {
     },
 
     create: async (companyId: string, data: Omit<typeof agents.$inferInsert, "companyId">, options?: CreateAgentOptions) => {
+      assertAgentCreationAllowed();
       assertBuiltInAgentMetadataMutationAllowed(null, data.metadata, options);
       if (data.reportsTo) {
         await ensureManager(companyId, data.reportsTo);

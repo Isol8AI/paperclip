@@ -316,48 +316,4 @@ describe("teams catalog routes", () => {
     expect(res.status, JSON.stringify(res.body)).toBe(403);
     expect(mockTeamsCatalogService.installCatalogTeam).not.toHaveBeenCalled();
   });
-
-  it("blocks agent catalog installs when governed agent creation is required", async () => {
-    // This route is the one agent-reachable create path that does not run
-    // through accessService.decide, so it carries the fence itself.
-    process.env.PAPERCLIP_REQUIRE_GOVERNED_AGENT_CREATION = "true";
-    try {
-      const app = await createApp({
-        type: "agent",
-        agentId: "agent-1",
-        companyId,
-        runId: "run-1",
-      });
-
-      const res = await request(app)
-        .post(`/api/companies/${companyId}/teams/catalog/product-engineering/install`)
-        .send({ collisionStrategy: "rename" });
-
-      expect(res.status, JSON.stringify(res.body)).toBe(403);
-      expect(res.body.code).toBe("governed_agent_creation_required");
-      expect(mockTeamsCatalogService.installCatalogTeam).not.toHaveBeenCalled();
-    } finally {
-      delete process.env.PAPERCLIP_REQUIRE_GOVERNED_AGENT_CREATION;
-    }
-  });
-
-  it("still allows board catalog installs when governed agent creation is required", async () => {
-    process.env.PAPERCLIP_REQUIRE_GOVERNED_AGENT_CREATION = "true";
-    try {
-      const app = await createApp({
-        type: "board",
-        userId: "board-user",
-        source: "session",
-        companyIds: [companyId],
-      });
-
-      const res = await request(app)
-        .post(`/api/companies/${companyId}/teams/catalog/product-engineering/install`)
-        .send({ collisionStrategy: "rename" });
-
-      expect(res.status, JSON.stringify(res.body)).toBe(201);
-    } finally {
-      delete process.env.PAPERCLIP_REQUIRE_GOVERNED_AGENT_CREATION;
-    }
-  });
 });
