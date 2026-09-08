@@ -70,6 +70,7 @@ import { assetRoutes } from "./routes/assets.js";
 import { accessRoutes } from "./routes/access.js";
 import { pluginRoutes } from "./routes/plugins.js";
 import { mcpGatewayProtocolRoutes, toolGatewayRoutes } from "./routes/tool-gateway.js";
+import { runAsCreationPrincipal } from "./services/agent-creation-policy.js";
 import { adapterRoutes } from "./routes/adapters.js";
 import { pluginUiStaticRoutes } from "./routes/plugin-ui-static.js";
 import { readBrandedStaticIndexHtml } from "./static-index-html.js";
@@ -324,6 +325,12 @@ export async function createApp(
       resolveSession: opts.resolveSession,
     }),
   );
+  // Carries "this request is an agent principal" down to agentService.create,
+  // the single seam every agent creation crosses. Must sit after the actor
+  // middleware and before any route. See services/agent-creation-policy.ts.
+  app.use((req, _res, next) => {
+    runAsCreationPrincipal(req.actor?.type === "agent", next);
+  });
   app.use("/api/auth", authRoutes(db));
   if (opts.betterAuthHandler) {
     app.all("/api/auth/{*authPath}", opts.betterAuthHandler);
